@@ -20,16 +20,45 @@ import asyncio
 import json
 import operator
 import os
+import struct
+import ctypes
 
 # Third Party
 import torch, torch_npu
 
 # First Party
 from vllm.utils import logger
+from vllm.config import VllmConfig
 from vllm_ascend.distributed.config_data import MoonCakeEngineKey
 
-METADATA_BYTES_LEN = 28
+METADATA_BYTES_LEN = 24
 
+
+DTYPE_TO_INT = {
+    None: 0,
+    torch.half: 1,
+    torch.float16: 2,
+    torch.bfloat16: 3,
+    torch.float: 4,
+    torch.float32: 4,
+    torch.float64: 5,
+    torch.double: 5,
+    torch.uint8: 6,
+    torch.float8_e4m3fn: 7,
+    torch.float8_e5m2: 8,
+}
+
+INT_TO_DTYPE = {
+    0: None,
+    1: torch.half,
+    2: torch.float16,
+    3: torch.bfloat16,
+    4: torch.float,
+    5: torch.float64,
+    6: torch.uint8,
+    7: torch.float8_e4m3fn,
+    8: torch.float8_e5m2,
+}
 
 @dataclass
 class MooncakeStoreConfig:
@@ -70,7 +99,6 @@ class MooncakeStoreConfig:
 class Mooncakestore():
     def __init__(
         self,
-        config: VllmConfig,
     ):
         try:
             from mooncake.store import MooncakeDistributedStore
@@ -101,10 +129,12 @@ class Mooncakestore():
             raise
 
     def exists(self, key: MoonCakeEngineKey) -> bool:
+        print(f"dfq get key:{key.to_string()}, exist:{self.store.is_exist(key.to_string())}")
         return self.store.is_exist(key.to_string())
 
-    def get(self, key: MoonCakeEngineKey) -> Optional[MemoryObj]:  #to be amend
+    def get(self, key: MoonCakeEngineKey) -> Optional[torch.Tensor]:  #to be amend
         key_str = key.to_string()
+        print(f"dfq get key:{key_str}")
         try:
             buffer = self.store.get_buffer(key_str)
         except Exception as e:
@@ -118,24 +148,43 @@ class Mooncakestore():
         if metadata_bytes is None or len(metadata_bytes) != METADATA_BYTES_LEN:
             return None
 
-        metadata = RemoteMetadata.deserialize(metadata_bytes)
+        length, dtype, shape0, shape1, shape2, shape3 = struct.unpack_from(
+            "iiiiii", metadata_bytes
+        ) 
+         
+        shape=torch.Size([shape0, shape1, shape2, shape3])
 
-      
-        return buffer
+        num_elements = reduce(operator.mul, shape)
+        temp_tensor = torch.frombuffer(
+                buffer,
+                dtype=INT_TO_DTYPE[dtype],
+                offset=METADATA_BYTES_LEN,
+                count=num_elements,
+            ).reshape(shape)
+        return temp_tensor
 
-    def put(self, key: MoonCakeEngineKey, memory_obj: MemoryObj):   #to be amend
+    def put(self, key: MoonCakeEngineKey, memory_tebsor: torch.Tensor, shape:torch.Size, dtype:torch.dtype):   #to be amend
         # Please use a function like `memory_obj.to_meta()`.
-        kv_bytes = memory_obj.byte_array
-        kv_shape = memory_obj.get_shape()
-        kv_dtype = memory_obj.get_dtype()
-        memory_format = memory_obj.get_memory_format()
+        num_bytes = memory_tebsor.numel() * memory_tebsor.element_size()
+        ptr = memory_tebsor.data_ptr()
+        ubyte_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
+        byte_array = (ctypes.c_ubyte * num_bytes).from_address(
+            ctypes.addressof(ubyte_ptr.contents)
+        )
+        kv_bytes=memoryview(byte_array)
 
-        metadata_bytes = RemoteMetadata(
-            len(kv_bytes), kv_shape, kv_dtype, memory_format
-        ).serialize()
+        metadata_bytes=struct.pack(
+            "iiiiii",
+            len(kv_bytes),
+            DTYPE_TO_INT[dtype],
+            shape[0],
+            shape[1],
+            shape[2],
+            shape[3],
+        )
         assert len(metadata_bytes) == METADATA_BYTES_LEN
         key_str = key.to_string()
-
+        print(f"dfq put key:{key_str}, len:{len(kv_bytes)}")
         try:
             self.store.put_parts(key_str, metadata_bytes, kv_bytes)
         except Exception as e:
@@ -144,6 +193,7 @@ class Mooncakestore():
                 f"meta type: {type(metadata_bytes)},"
                 f"data: {type(kv_bytes)}: {e}"
             )
+        print(f"dfq put key:{key_str}, len:{len(kv_bytes)}")
 
     @no_type_check
     def list(self) -> List[str]:
