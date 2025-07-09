@@ -1,154 +1,217 @@
-# Copyright 2024-2025 LMCache Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 # Standard
 from dataclasses import dataclass
-from functools import reduce
-from typing import List, Optional, no_type_check
-import asyncio
-import json
-import operator
+import hashlib
+from typing import Any, Iterable, List, Optional, Tuple, Union
 import os
+import re
 
 # Third Party
+from numpy import array
 import torch, torch_npu
+import yaml
 
 # First Party
-from vllm.utils import logger
-from vllm_ascend.distributed.config_data import MoonCakeEngineKey
-
-METADATA_BYTES_LEN = 28
-
 
 @dataclass
-class MooncakeStoreConfig:
-    local_hostname: str
-    metadata_server: str
-    global_segment_size: int
-    local_buffer_size: int
-    protocol: str
-    device_name: str
-    master_server_address: str
+class MoonCakeEngineMetadata:
+    """name of the LLM model"""
 
-    @staticmethod
-    def from_file(file_path: str) -> "MooncakeStoreConfig":
-        """Load the config from a JSON file."""
-        with open(file_path) as fin:
-            config = json.load(fin)
-        return MooncakeStoreConfig(
-            local_hostname=config.get("local_hostname"),
-            metadata_server=config.get("metadata_server"),
-            global_segment_size=config.get("global_segment_size", 3355443200),
-            local_buffer_size=config.get("local_buffer_size", 1073741824),
-            protocol=config.get("protocol", "tcp"),
-            device_name=config.get("device_name", ""),
-            master_server_address=config.get("master_server_address"),
+    model_name: str
+    """ world size when running under a distributed setting """
+    world_size: int
+    """ worker id when running under a distributed setting """
+    worker_id: int
+    """ the format of kv tensors """
+    kv_dtype: torch.dtype
+    """ the shape of kv tensors """
+    """ (num_layer, 2, metadata.block_size, num_kv_head, head_size) """
+    kv_shape: tuple[int, int, int, int, int]
+    block_size: int = 128
+    """ whether use MLA"""
+    use_mla: bool = False
+    
+@dataclass(order=True)
+class MoonCakeEngineKey:
+    model_name: str
+    world_size: int
+    worker_id: int
+    chunk_hash: str
+
+    def __hash__(self):
+        return hash(
+            (
+                self.model_name,
+                self.world_size,
+                self.worker_id,
+                self.chunk_hash,
+            )
         )
 
+    def to_string(self):
+        return (
+            f"{self.model_name}@{self.world_size}"
+            f"@{self.worker_id}@{self.chunk_hash}"
+        )
+
+    # def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
+    #     """Split the key into multiple keys for each layer"""
+    #     keys = []
+    #     for layer_id in range(num_layers):
+    #         keys.append(
+    #             LayerCacheEngineKey(
+    #                 self.fmt,
+    #                 self.model_name,
+    #                 self.world_size,
+    #                 self.worker_id,
+    #                 self.chunk_hash,
+    #                 layer_id,
+    #             )
+    #         )
+    #     return keys
+
+    # def get_first_layer(self) -> "LayerCacheEngineKey":
+    #     """Return the key for the first layer"""
+    #     key = LayerCacheEngineKey(
+    #         self.fmt,
+    #         self.model_name,
+    #         self.world_size,
+    #         self.worker_id,
+    #         self.chunk_hash,
+    #         0,
+    #     )
+    #     return key
+
     @staticmethod
-    def load_from_env() -> "MooncakeStoreConfig":
-        """Load config from a file specified in the environment variable."""
-        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
-        if config_file_path is None:
-            raise ValueError(
-                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
-            )
-        return MooncakeStoreConfig.from_file(config_file_path)
+    def from_string(s):
+        parts = s.split("@")
+        if len(parts) != 5:
+            raise ValueError(f"Invalid key string: {s}")
+        return MoonCakeEngineKey(
+            parts[0], parts[1], int(parts[2]), int(parts[3]), parts[4]
+        )
+
+    def to_dict(self):
+        # Note(Kuntai): this is used for serializing CacheEngineKey via msgpack.
+        return {
+            "__type__": "CacheEngineKey",
+            "model_name": self.model_name,
+            "world_size": self.world_size,
+            "worker_id": self.worker_id,
+            "chunk_hash": self.chunk_hash,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        return MoonCakeEngineKey(
+            model_name=d["model_name"],
+            world_size=d["world_size"],
+            worker_id=d["worker_id"],
+            chunk_hash=d["chunk_hash"],
+        )
 
 
-class Mooncakestore():
+class ChunkedTokenDatabase():
     def __init__(
         self,
-        config: VllmConfig,
+        metadata: Optional[MoonCakeEngineMetadata] = None,
     ):
-        try:
-            from mooncake.store import MooncakeDistributedStore
-        except ImportError as e:
-            raise ImportError(
-                "Please install mooncake by following the instructions at "
-                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run vLLM with MooncakeConnector.") from e
+        self.metadata = metadata
 
-        try:
-            self.store = MooncakeDistributedStore()
-            self.config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded successfully.")
-            print(f"protocol:{ self.config.protocol}")
-            self.store.setup(self.config.local_hostname,
-                             self.config.metadata_server,
-                             self.config.global_segment_size,
-                             self.config.local_buffer_size,
-                             self.config.protocol, self.config.device_name,
-                             self.config.master_server_address)
+    def _make_key_by_hash(self, chunk_hash: str, layer_id: Optional[int] = None):
+        assert self.metadata is not None
+        return MoonCakeEngineKey(
+            self.metadata.model_name,
+            self.metadata.world_size,
+            self.metadata.worker_id,
+            chunk_hash,
+        )
 
-        except ValueError as e:
-            logger.error("Configuration loading failed: %s", e)
-            raise
-        except Exception as exc:
-            logger.error(
-                "An error occurred while loading the configuration: %s", exc)
-            raise
+    def _hash(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        prefix_hash: str,
+    ) -> str:
+        # TODO: change it to a more efficient hash function
+        if isinstance(tokens, torch.Tensor):
+            tokens_bytes = tokens.cpu().to(torch.uint32).numpy().tobytes()
+        elif isinstance(tokens, list):
+            tokens_bytes = array.array("I", tokens).tobytes()
+        return hashlib.sha256(prefix_hash.encode("ascii") + tokens_bytes).hexdigest()
 
-    def exists(self, key: MoonCakeEngineKey) -> bool:
-        return self.store.is_exist(key.to_string())
+    def _chunk_tokens(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+    ) -> Iterable[Union[torch.Tensor, List[int]]]:
+        """
+        Chunk the tokens into chunks of size self.metadata.block_size.
 
-    def get(self, key: MoonCakeEngineKey) -> Optional[MemoryObj]:  #to be amend
-        key_str = key.to_string()
-        try:
-            buffer = self.store.get_buffer(key_str)
-        except Exception as e:
-            logger.error(f"Failed to get key {key_str}. {e}")
+        :param tokens: the input tokens, with shape [seq_len]
+            device: the target device after chunking
 
-        if buffer is None:
-            return None
+        :return: a generator of chunks of tokens, each with
+                shape [metadata.block_size]
+        """
+        for i in range(0, len(tokens), self.metadata.block_size):
+            yield tokens[i : i + self.metadata.block_size]
 
-        retrieved_view = memoryview(buffer)   
-        metadata_bytes = retrieved_view[:METADATA_BYTES_LEN]
-        if metadata_bytes is None or len(metadata_bytes) != METADATA_BYTES_LEN:
-            return None
+    def _prefix_hash(
+        self,
+        token_chunks: Iterable[Union[torch.Tensor, List[int]]],
+    ) -> Iterable[str]:
+        prefix_hash = ''
+        for token_chunk in token_chunks:
+            prefix_hash = self._hash(token_chunk, prefix_hash)
+            yield prefix_hash
 
-        metadata = RemoteMetadata.deserialize(metadata_bytes)
+    def process_tokens(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        mask: Optional[torch.Tensor] = None,
+        make_key: bool = True,
+    ) -> Iterable[Tuple[int, int, Union[MoonCakeEngineKey, str]]]:
+        """Process the tokens and return the corresponding cache engine keys.
 
-      
-        return buffer
+        :param Union[torch.Tensor, List[int]] tokens: The tokens to process.
 
-    def put(self, key: MoonCakeEngineKey, memory_obj: MemoryObj):   #to be amend
-        # Please use a function like `memory_obj.to_meta()`.
-        kv_bytes = memory_obj.byte_array
-        kv_shape = memory_obj.get_shape()
-        kv_dtype = memory_obj.get_dtype()
-        memory_format = memory_obj.get_memory_format()
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask should ALWAYS be like
+            FFFFFTTTTTTT, where True means the tokens needs to be matched,
+            and the Falses will ALWAYS be at the PREFIX of the tensor.
 
-        metadata_bytes = RemoteMetadata(
-            len(kv_bytes), kv_shape, kv_dtype, memory_format
-        ).serialize()
-        assert len(metadata_bytes) == METADATA_BYTES_LEN
-        key_str = key.to_string()
+        :param bool make_key: Whether to make the cache engine key or not.
+            If False, the hash value will be returned instead.
 
-        try:
-            self.store.put_parts(key_str, metadata_bytes, kv_bytes)
-        except Exception as e:
-            logger.error(
-                f"Failed to put key {key_str},"
-                f"meta type: {type(metadata_bytes)},"
-                f"data: {type(kv_bytes)}: {e}"
+        :returns: A iterable of tuples with three elements. The first element
+            is the start index of the tokens for the key. The second element
+            is the end index of the tokens for the key. The third element is
+            the cache engine key (or hash) for the tokens.
+
+        :raises: ValueError if the number of Falses in the mask is not a
+            multiple of the chunk size.
+        """
+        if mask is not None:
+            num_falses = mask.numel() - mask.long().sum().item()
+        else:
+            num_falses = 0
+
+        if num_falses % self.metadata.block_size != 0:
+            raise ValueError(
+                "The number of Falses in the mask is not a multiple of the chunk size."
             )
+        total_len = len(tokens)
 
-    @no_type_check
-    def list(self) -> List[str]:
-        pass
+        token_chunks = self._chunk_tokens(tokens)
+        prefix_hashes = self._prefix_hash(token_chunks)
 
-    def close(self):
-        self.store.close()
-        logger.info("Closed the mooncake store connection")
+        start_idx = 0
+        for chunk_id, hash_val in enumerate(prefix_hashes):
+            start_idx = chunk_id * self.metadata.block_size
+            end_idx = min(start_idx + self.metadata.block_size, total_len)
+            if start_idx < num_falses:
+                continue
+            else:
+                if make_key:
+                    yield start_idx, end_idx, self._make_key_by_hash(hash_val)
+                else:
+                    yield start_idx, end_idx, hash_val
+
