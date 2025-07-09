@@ -22,7 +22,7 @@ import struct
 
 from concurrent.futures import Future
 
-from vllm_ascend import envs
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
@@ -114,7 +114,21 @@ class RequestTracker:
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=0,
         )
-
+   
+    def update(
+        self,
+        cached_request: "CachedRequestData",
+    ) -> None:
+        """Update the request tracker when a running request is
+        scheduled again
+        """
+        self.token_ids.extend(cached_request.new_token_ids)
+        new_block_ids: list[int]
+        if not isinstance(cached_request.new_block_ids[0], list):
+            new_block_ids = cached_request.new_block_ids
+        else:
+            new_block_ids = cached_request.new_block_ids[0]
+        self.allocated_block_ids.extend(new_block_ids)
 
 @dataclass
 class ReqMeta:
@@ -244,15 +258,30 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         """
         self.requests.append(req_meta)
 
+
 class MooncakeConnectorV1(KVConnectorBase_V1):
 
-    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, parent: KVConnectorBase_V1,):
+    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
-        self._parent = parent
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         # is_tp = vllm_config.parallel_config.tensor_parallel_size > 1
+
+        self.kv_caches: dict[str, torch.Tensor] = {}
+
+        self._block_size = vllm_config.cache_config.block_size
+
+
+        self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
+            "skip_last_n_tokens", 0
+        )
+
+        self.num_layers = vllm_config.model_config.get_num_layers(
+            vllm_config.parallel_config
+        )
+        self.current_layer = 0
+
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakeConnectorV1Scheduler(vllm_config) 
+            self.connector_scheduler = MooncakeConnectorV1Scheduler(vllm_config, self.skip_last_n_tokens) 
         else:
             self.connector_worker = MoonCakeEngine(
                 vllm_config.model_config,
@@ -269,32 +298,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
                 self.lookup_server = MooncakeLookupServer(
                     self.connector_worker, vllm_config
                 )
-
-        self.kv_caches: dict[str, torch.Tensor] = {}
-
-        self._block_size = vllm_config.cache_config.block_size
-
-        # request_id -> (vllm cached tokes, lmcache cached tokens)
-        self.load_specs: dict[str, LoadSpec] = {}
-
-        # request_id -> full_token_ids
-        self._request_trackers: dict[str, RequestTracker] = {}
-
-        # Whether to discard partial chunks
-        self._discard_partial_chunks = (
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "discard_partial_chunks", False
-            )
-        )
-
-        self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
-            "skip_last_n_tokens", 0
-        )
-
-        self.num_layers = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
-        self.current_layer = 0
     
     def _init_kv_caches_from_forward_context(self, forward_context: "ForwardContext"):
         for layer_name in forward_context.no_compile_layers:
@@ -342,7 +345,7 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         if len(self.kv_caches) == 0:
             self._init_kv_caches_from_forward_context(forward_context)
 
-        metadata = self._parent._get_connector_metadata()
+        metadata = self._get_connector_metadata()
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -414,10 +417,10 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
             # Don't do save if the role is kv_consumer
             return
 
-        if self.use_layerwise:
-            return
+        # if self.use_layerwise:
+        #     return
 
-        connector_metadata = self._parent._get_connector_metadata()
+        connector_metadata = self._get_connector_metadata()
        
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -495,14 +498,27 @@ def get_zmq_rpc_path_lmcache(
 
 
 class MooncakeConnectorV1Scheduler:
-    def __init__(self, role: KVConnectorRole, is_tp: bool, vllm_config: "VllmConfig"):
-        self.client=MooncakeLookupClient(role, is_tp, vllm_config)
+    def __init__(self, vllm_config: "VllmConfig", skip_last_n_tokens):
+        self.client=MooncakeLookupClient(vllm_config)
+        self.kv_role = vllm_config.kv_transfer_config.kv_role
+                # request_id -> (vllm cached tokes, lmcache cached tokens)
+        self.load_specs: dict[str, LoadSpec] = {}
+        self.skip_last_n_tokens = skip_last_n_tokens
+        self._block_size = vllm_config.cache_config.block_size
+                # request_id -> full_token_ids
+        self._request_trackers: dict[str, RequestTracker] = {}
+                # Whether to discard partial chunks
+        self._discard_partial_chunks = (
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "discard_partial_chunks", False
+            )
+        )
     
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """
         Check for external KV cache hit.
 
@@ -516,15 +532,15 @@ class MooncakeConnectorV1Scheduler:
             external KV cache beyond what is already computed.
         """
         if self.kv_role == "kv_producer":
-            return 0
+            return 0, False
 
         token_ids = torch.tensor(request.prompt_token_ids)
         if self.skip_last_n_tokens > 0:
-            num_external_hit_tokens = self.lookup_client.lookup(
+            num_external_hit_tokens = self.client.lookup(
                 token_ids[: -self.skip_last_n_tokens]
             )
         else:
-            num_external_hit_tokens = self.lookup_client.lookup(token_ids)
+            num_external_hit_tokens = self.client.lookup(token_ids)
 
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
@@ -544,7 +560,7 @@ class MooncakeConnectorV1Scheduler:
         )
 
         if need_to_allocate <= 0:
-            return 0
+            return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
@@ -555,7 +571,7 @@ class MooncakeConnectorV1Scheduler:
         # TODO: Align to vLLM block size. Should test whether it can be removed
         # need_to_allocate = need_to_allocate // self._block_size * \
         #        self._block_size
-        return need_to_allocate
+        return need_to_allocate, False
 
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):
         """
@@ -647,10 +663,10 @@ class MooncakeConnectorV1Scheduler:
 
 
 class MooncakeLookupClient:
-    def __init__(self, role: KVConnectorRole, is_tp: bool, vllm_config: "VllmConfig"):
+    def __init__(self, vllm_config: "VllmConfig"):
         self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lmcache(role, is_tp, vllm_config)
+        socket_path = get_zmq_rpc_path_lmcache(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
@@ -708,7 +724,6 @@ class MooncakeLookupServer:
     def close(self):
         self.socket.close(linger=0)
         # TODO: close the thread!
-
 
 
 
