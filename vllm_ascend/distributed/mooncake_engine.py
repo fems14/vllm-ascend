@@ -22,8 +22,15 @@ import time
 import torch, torch_npu
 from vllm.utils import cdiv, get_kv_cache_torch_dtype, round_down
 from vllm.utils import logger
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+)
 from vllm_ascend.distributed.config_data import MoonCakeEngineMetadata, ChunkedTokenDatabase
 from vllm_ascend.distributed.mooncake_store import Mooncakestore
+from vllm_ascend.distributed.mooncake_store_npu import PagedMemNPUConnector
 # First Party
 
 
@@ -72,6 +79,7 @@ class MoonCakeEngine:
         num_kv_head = model_config.get_num_kv_heads(parallel_config)
         head_size = model_config.get_head_size()
         kv_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype, model_config.dtype)
+        hidden_dim_size = num_kv_head * head_size
         if use_mla:
             kv_shape = (num_layer, 1, chunk_size, 1, head_size)
         else:
@@ -85,6 +93,8 @@ class MoonCakeEngine:
             chunk_size,
             use_mla,
         )
+        self.npu_transfer=PagedMemNPUConnector(hidden_dim_size, num_layer)
+
 
         self.token_database = ChunkedTokenDatabase(self.metadata)
 
@@ -129,14 +139,16 @@ class MoonCakeEngine:
         # monitor_req_id = self.stats_monitor.on_store_request(num_stored_tokens)
 
         for start, end, key in self.token_database.process_tokens(tokens, mask):
-            if self.m_store.contains(key):
+            if self.m_store.exists(key):
                 continue
             # Allocate the memory object
             num_tokens = end - start
+            kv_shape = self.npu_transfer.get_shape(num_tokens)
             kv_dtype = self.metadata.kv_dtype
-
+            tensor = torch.empty(kv_shape, dtype=kv_dtype) 
             # self.gpu_connector.from_gpu(memory_obj, start, end, **kwargs)  D2H
-            self.m_store.put(key, memory_obj)
+            self.npu_transfer.npu_d2h(tensor, start, end, **kwargs)
+            self.m_store.put(key, tensor, kv_shape, kv_dtype)
 
         # self.stats_monitor.on_store_finished(monitor_req_id)
 
@@ -179,13 +191,13 @@ class MoonCakeEngine:
         ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             # Get the memory object from the storage backend
-            try:
-                memory_cache = self.m_store.get(key)    
-            except Exception as e:
-                logger.warning(f"Error occurred in get: {e}")
+            # try:
+            memory_tensor = self.m_store.get(key)    
+            # except Exception as e:
+            #     logger.warning(f"Error occurred in get: {e}")
          
             ret_mask[start:end] = True
-
+            self.npu_transfer.npu_h2d(memory_tensor, start, end, **kwargs)
             # self.gpu_connector.to_gpu(memory_obj, start, end, **kwargs)     need H2D  
 
         retrieved_tokens = torch.sum(ret_mask)
@@ -245,30 +257,31 @@ class MoonCakeEngine:
         # all tokens where found, return the maximal end
         return end
 
-    def clear(
-        self,
-        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
-        locations: Optional[List[str]] = None,
-    ) -> int:
-        assert isinstance(self.storage_manager, StorageManager)
-        # Clear all caches if tokens is None
-        if tokens is None or len(tokens) == 0:
-            num_cleared = self.storage_manager.clear(locations)
-            return num_cleared
+    # def clear(
+    #     self,
+    #     tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+    #     locations: Optional[List[str]] = None,
+    # ) -> int:
+    #     # Clear all caches if tokens is None
+    #     if tokens is None or len(tokens) == 0:
+    #         num_cleared = self.storage_manager.clear(locations)
+    #         return num_cleared
 
-        num_removed = 0
-        # Only remove the caches for the given tokens
-        for start, end, key in self.token_database.process_tokens(tokens):
-            assert isinstance(key, CacheEngineKey)
-            removed = self.storage_manager.remove(key, locations)
-            num_removed += removed
-        return num_removed
+    #     num_removed = 0
+    #     # Only remove the caches for the given tokens
+    #     for start, end, key in self.token_database.process_tokens(tokens):
+    #         # assert isinstance(key, CacheEngineKey)
+    #         removed = self.storage_manager.remove(key, locations)
+    #         num_removed += removed
+    #     return num_removed
 
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
+        
+        self.m_store.close()
 
-        if self.lmcache_worker is not None:
-            self.lmcache_worker.close()
+        # if self.lmcache_worker is not None:
+        #     self.lmcache_worker.close()
 
-        self.storage_manager.close()
-        logger.info("LMCacheEngine closed.")
+        # self.storage_manager.close()
+        # logger.info("LMCacheEngine closed.")
