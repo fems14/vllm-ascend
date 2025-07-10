@@ -155,6 +155,55 @@ class MoonCakeEngine:
         logger.debug(f"Stored {num_stored_tokens} out of total {len(tokens)} tokens")
 
     @torch.inference_mode()
+    def store_layer(
+        self,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        layer_name: str =None,
+        **kwargs,
+    ) -> None:
+        """Store the tokens and mask into the cache engine.
+
+        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask should ALWAYS be like
+            FFFFFTTTTTTT, where True means the tokens needs to be matched,
+            and the Falses will ALWAYS be at the PREFIX of the tensor.
+
+        :param **kwargs: The additional arguments for the storage backend which
+            will be passed into the gpu_connector.
+            Should include KV cache specific information (e.g., paged KV buffer
+            and the page tables).
+
+        :raises: ValueError if the number of Falses in the mask is not a
+            multiple of the chunk size.
+        """
+
+        if mask is not None:
+            num_stored_tokens = torch.sum(mask).item()
+        else:
+            num_stored_tokens = len(tokens)
+        # monitor_req_id = self.stats_monitor.on_store_request(num_stored_tokens)
+        for start, end, key in self.token_database.process_tokens(tokens, mask):
+
+            key.chunk_hash=key.chunk_hash+layer_name
+            if self.m_store.exists(key):
+                continue
+            # Allocate the memory object
+            num_tokens = end - start
+            kv_shape = self.npu_transfer.get_shape_layer(num_tokens)
+            kv_dtype = self.metadata.kv_dtype
+            tensor = torch.empty(kv_shape, dtype=kv_dtype)
+            # self.gpu_connector.from_gpu(memory_obj, start, end, **kwargs)  D2H
+            self.npu_transfer.npu_d2h_layer(tensor, start, end, **kwargs)
+            self.m_store.put(key, tensor, kv_shape, kv_dtype)
+
+        # self.stats_monitor.on_store_finished(monitor_req_id)
+
+        logger.debug(f"Stored {num_stored_tokens} out of total {len(tokens)} tokens")
+
+    @torch.inference_mode()
     def retrieve(
         self,
         tokens: torch.Tensor,
@@ -209,6 +258,64 @@ class MoonCakeEngine:
         )
         return ret_mask
 
+
+    @torch.inference_mode()
+    def retrieve_layer(
+        self,
+        tokens: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        layer_name: str =None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Retrieve the KV caches from the cache engine. And put the retrieved
+        KV cache to the serving engine via the GPU connector.
+
+        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask should ALWAYS be like
+            FFFFFTTTTTTT, where True means the tokens needs to be matched,
+            and the Falses will ALWAYS be at the PREFIX of the tensor.
+
+        :param **kwargs: The additional arguments for the storage backend which
+            will be passed into the gpu_connector.
+            Should include KV cache specific information (e.g., paged KV buffer
+            and the page tables).
+
+        :return: the boolean mask indicating which tokens are retrieved. The
+            length of the mask should be the same as the tokens. On CPU.
+
+        :raises: ValueError if the number of Falses in the mask is not a
+            multiple of the chunk size.
+        """
+        if mask is not None:
+            num_required_tokens = torch.sum(mask).item()
+        else:
+            num_required_tokens = len(tokens)
+        # monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)  monitor is usseful?
+
+        ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
+        for start, end, key in self.token_database.process_tokens(tokens, mask):
+            # Get the memory object from the storage backend
+            # try:
+            key.chunk_hash=key.chunk_hash+layer_name
+            res=self.m_store.exists(key)
+            memory_tensor = self.m_store.get(key)
+            # except Exception as e:
+            #     logger.warning(f"Error occurred in get: {e}")
+
+            ret_mask[start:end] = True
+            self.npu_transfer.npu_h2d_layer(memory_tensor, start, end, **kwargs)
+            # self.gpu_connector.to_gpu(memory_obj, start, end, **kwargs)     need H2D
+
+        retrieved_tokens = torch.sum(ret_mask)
+        # self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        logger.debug(
+            f"Retrieved {retrieved_tokens} "
+            f"out of {num_required_tokens} "
+            f"out of total {len(tokens)} tokens"
+        )
+        return ret_mask
     # def prefetch(
     #     self,
     #     tokens: torch.Tensor,
@@ -226,6 +333,7 @@ class MoonCakeEngine:
         self,
         tokens: Union[torch.Tensor, List[int]],
         pin: bool = False,
+        use_layerwize: bool =False
     ) -> int:
         """
         Checks the existence of KV cache of the tokens from the cache engine.
@@ -245,6 +353,8 @@ class MoonCakeEngine:
 
         for start, end, key in self.token_database.process_tokens(tokens):
             try:
+                if use_layerwize:
+                    key.chunk_hash=key.chunk_hash+"model.layers.0.self_attn.attn"
                 res=self.m_store.exists(key)
                 if res:
                     continue
@@ -285,3 +395,4 @@ class MoonCakeEngine:
 
         # self.storage_manager.close()
         # logger.info("LMCacheEngine closed.")
+

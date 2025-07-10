@@ -269,6 +269,8 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         self.kv_caches: dict[str, torch.Tensor] = {}
 
         self._block_size = vllm_config.cache_config.block_size
+        
+        self.use_layerwize=vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwize")
 
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
@@ -357,66 +359,156 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
 
         self.layerwise_retrievers = []
         for request in metadata.requests:
-            if request.load_spec is None:
-                continue
-
-            tokens = request.token_ids
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.npu()
-            assert len(tokens) == len(slot_mapping)
-
-            token_mask = torch.ones_like(tokens, dtype=torch.bool)
-            masked_token_count = (
-                request.load_spec.vllm_cached_tokens
-                // self._block_size
-                * self._block_size
-            )   # align vllm?
-            token_mask[:masked_token_count] = False
-
-            if self.skip_last_n_tokens > 0:
-                tokens = tokens[: -self.skip_last_n_tokens]
-                token_mask = token_mask[: -self.skip_last_n_tokens]
-
-            ret_token_mask = self.connector_worker.retrieve(
-                tokens,
-                token_mask,
-                kvcaches=kvcaches,
-                slot_mapping=slot_mapping,
-            )
-
-            # Check the result
-            num_retrieved_tokens = ret_token_mask.sum().item()
-            num_expected_tokens = (
-                request.load_spec.lmcache_cached_tokens
-                - request.load_spec.vllm_cached_tokens
-                - self.skip_last_n_tokens
-            )
-            if num_retrieved_tokens < num_expected_tokens:
-                logger.error(
-                    "The number of retrieved tokens is less than the "
-                    "expected number of tokens! This should not happen!"
+            if self.use_layerwize:
+                if request.load_spec is None:
+                    continue
+                tokens = request.token_ids
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = request.slot_mapping.npu()
+                assert len(tokens) == len(slot_mapping)
+                token_mask = torch.ones_like(tokens, dtype=torch.bool)
+                masked_token_count = (
+                    request.load_spec.vllm_cached_tokens
+                    // self._block_size
+                    * self._block_size
+                )   # align vllm?
+                token_mask[:masked_token_count] = False
+                
+                if self.skip_last_n_tokens > 0:
+                    tokens = tokens[: -self.skip_last_n_tokens]
+                    token_mask = token_mask[: -self.skip_last_n_tokens]
+                for layer_name in forward_context.no_compile_layers:
+                    attn_layer = forward_context.no_compile_layers[layer_name]
+                    kv_cache_layer = attn_layer.kv_cache[forward_context.virtual_engine]
+                    ret_token_mask = self.connector_worker.retrieve_layer(
+                    tokens,
+                    token_mask,
+                    layer_name,
+                    kvcaches=kv_cache_layer,
+                    slot_mapping=slot_mapping,
                 )
-                logger.error(
-                    "Num retrieved tokens: %d, num expected tokens: %d",
-                    num_retrieved_tokens,
-                    num_expected_tokens,
+            else:    
+                if request.load_spec is None:
+                    continue
+    
+                tokens = request.token_ids
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = request.slot_mapping.npu()
+                assert len(tokens) == len(slot_mapping)
+    
+                token_mask = torch.ones_like(tokens, dtype=torch.bool)
+                masked_token_count = (
+                    request.load_spec.vllm_cached_tokens
+                    // self._block_size
+                    * self._block_size
+                )   # align vllm?
+                token_mask[:masked_token_count] = False
+    
+                if self.skip_last_n_tokens > 0:
+                    tokens = tokens[: -self.skip_last_n_tokens]
+                    token_mask = token_mask[: -self.skip_last_n_tokens]
+    
+                ret_token_mask = self.connector_worker.retrieve(
+                    tokens,
+                    token_mask,
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping,
                 )
-
+    
+                # Check the result
+                num_retrieved_tokens = ret_token_mask.sum().item()
+                num_expected_tokens = (
+                    request.load_spec.lmcache_cached_tokens
+                    - request.load_spec.vllm_cached_tokens
+                    - self.skip_last_n_tokens
+                )
+                if num_retrieved_tokens < num_expected_tokens:
+                    logger.error(
+                        "The number of retrieved tokens is less than the "
+                        "expected number of tokens! This should not happen!"
+                    )
+                    logger.error(
+                        "Num retrieved tokens: %d, num expected tokens: %d",
+                        num_retrieved_tokens,
+                        num_expected_tokens,
+                    )
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """MooncakeConnector does not do layerwise saving."""
         pass
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
         """MooncakeConnector does not save explicitly."""
-        pass
+        if self.kv_role == "kv_consumer":
+            # Don't do save if the role is kv_consumer
+            return
+        if not self.use_layerwize:
+            return
+        # if self.use_layerwise:
+        #     return
+
+        connector_metadata = self._get_connector_metadata()
+       
+        assert len(self.kv_caches) > 0
+        kvcaches = list(self.kv_caches.values())
+
+        for request in connector_metadata.requests:
+            save_spec = request.save_spec
+            if save_spec is None or not save_spec.can_save:
+                continue
+
+            token_ids = request.token_ids
+            assert isinstance(token_ids, torch.Tensor)
+            assert token_ids.is_cpu  # why is cpu?
+
+            slot_mapping = request.slot_mapping
+            assert isinstance(slot_mapping, torch.Tensor)
+            assert len(slot_mapping) == len(token_ids)
+            # TODO: have a pre-allocated buffer to hold the slot_mappings
+            slot_mapping = slot_mapping.npu()
+            # NOTE: In PD setting, lmcache_engine.lookup() will always return
+            # 0 if there is no local storage configured. In this case, we
+            # should rely on the slip_leading_tokens in save_spec to avoid
+            # transmit the already saved tokens again.
+            skip_leading_tokens = max(
+                self.connector_worker.lookup(token_ids),
+                save_spec.skip_leading_tokens,
+            )
+            if skip_leading_tokens == len(token_ids):
+                continue  # skip this request
+            # Align to lmcache chunk size
+            skip_leading_tokens = (
+                skip_leading_tokens
+                // self._block_size
+                * self._block_size
+            )
+            
+            store_mask = torch.ones_like(token_ids, dtype=torch.bool)
+            store_mask[:skip_leading_tokens] = False
+            
+            logger.info(
+                "Storing KV cache for %d out of %d tokens "
+                "(skip_leading_tokens=%d) for request %s",
+                len(token_ids) - skip_leading_tokens,
+                len(token_ids),
+                skip_leading_tokens,
+                request.req_id,
+            )
+            self.connector_worker.store_layer(
+                token_ids,
+                mask=store_mask,
+                layer_name=layer_name,
+                kvcaches=kv_layer,
+                slot_mapping=slot_mapping,
+                offset=skip_leading_tokens,
+            )
 
     def wait_for_save(self):
         """MooncakeConnector does not save explicitly."""
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
-
+        if self.use_layerwize:
+            return
         # if self.use_layerwise:
         #     return
 
@@ -703,6 +795,7 @@ class MooncakeLookupServer:
 
         self.mooncake_engine = mooncake_engine
         self.running = True
+        self.use_layerwize=vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwize")
 
         def process_request():
             while self.running:
@@ -710,7 +803,8 @@ class MooncakeLookupServer:
                 # request = self.socket.recv()
                 frames = self.socket.recv_multipart(copy=False)
                 token_ids = self.decoder.decode(frames)
-                result = self.mooncake_engine.lookup(token_ids)
+               
+                result = self.mooncake_engine.lookup(token_ids,use_layerwize=self.use_layerwize)
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
                 # except Exception as e:
