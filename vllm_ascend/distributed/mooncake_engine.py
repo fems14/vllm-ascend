@@ -30,7 +30,7 @@ from vllm.config import (
 )
 from vllm_ascend.distributed.config_data import MoonCakeEngineMetadata, ChunkedTokenDatabase
 from vllm_ascend.distributed.mooncake_store import Mooncakestore
-from vllm_ascend.distributed.mooncake_store_npu import PagedMemNPUConnector
+from vllm_ascend.distributed.mooncake_store_npu import PagedMemNPUConnector,PagedMemNPUConnectorMLA
 # First Party
 
 
@@ -93,7 +93,10 @@ class MoonCakeEngine:
             chunk_size,
             use_mla,
         )
-        self.npu_transfer=PagedMemNPUConnector(hidden_dim_size, num_layer)
+        if use_mla:
+            self.npu_transfer=PagedMemNPUConnectorMLA(hidden_dim_size, num_layer)
+        else:
+            self.npu_transfer=PagedMemNPUConnector(hidden_dim_size, num_layer)
 
 
         self.token_database = ChunkedTokenDatabase(self.metadata)
