@@ -19,7 +19,7 @@ from vllm.config import (
 )
 from vllm_ascend.distributed.config_data import MoonCakeEngineKey, MoonCakeEngineMetadata, ChunkedTokenDatabase, LayerMoonCakeEngineKey
 from vllm_ascend.distributed.mooncake_store import Mooncakestore
-from vllm_ascend.distributed.mooncake_store_npu import PagedMemNPUConnector
+from vllm_ascend.distributed.mooncake_store_npu import PagedMemNPUConnector, PagedMemNPUConnectorMLA
 # First Party
 
 
@@ -74,7 +74,11 @@ class MoonCakeEngine:
 
         self.m_store = Mooncakestore()
 
-        self.npu_transfer=PagedMemNPUConnector(hidden_dim_size, num_layer, self.m_store)
+        if self.use_mla:
+            self.npu_transfer=PagedMemNPUConnectorMLA(hidden_dim_size, num_layer, self.m_store)
+        else:
+            self.npu_transfer=PagedMemNPUConnector(hidden_dim_size, num_layer, self.m_store)
+
 
         if use_layerwize:
             self.load_stream = torch.npu.Stream()
