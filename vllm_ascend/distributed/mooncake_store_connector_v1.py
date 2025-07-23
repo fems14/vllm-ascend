@@ -35,8 +35,8 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 class LoadSpec:
     # Number of tokens cached in vLLM
     vllm_cached_tokens: int
-    # Number of tokens that are cached in LMCache
-    lmcache_cached_tokens: int
+    # Number of tokens that are cached in mooncake
+    mooncake_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
 
@@ -137,7 +137,6 @@ class ReqMeta:
         Args:
             tracker (RequestTracker): the request tracker.
             block_size (int): the block size in vLLM.
-            lmcache_chunk_size (int): the chunk size for LMCache.
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             skip_save (bool): whether to skip the save operation.
             discard_partial_chunks (bool): whether to discard partial chunks.
@@ -153,7 +152,6 @@ class ReqMeta:
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
         skip_leading_tokens = tracker.num_saved_tokens
-        print(f"skip_leading_tokens:{skip_leading_tokens}")
         chunk_boundary = (
             cdiv(tracker.num_saved_tokens + 1, block_size) * block_size
         )
@@ -207,7 +205,7 @@ class ReqMeta:
         if load_spec is not None and load_spec.can_load:
             logger.debug(
                 "Scheduled to load %d tokens for request %s",
-                load_spec.lmcache_cached_tokens,
+                load_spec.mooncake_cached_tokens,
                 tracker.req_id,
             )
         else:
@@ -373,7 +371,7 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 num_expected_tokens = (
-                    request.load_spec.lmcache_cached_tokens
+                    request.load_spec.mooncake_cached_tokens
                     - request.load_spec.vllm_cached_tokens
                     - self.skip_last_n_tokens
                 )
@@ -434,7 +432,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
                     self.connector_worker.lookup(token_ids, self.use_layerwise),
                     save_spec.skip_leading_tokens,
                 )
-                print(f"AAAAAA skip_leading_tokens:{skip_leading_tokens}")
                 if skip_leading_tokens == len(token_ids):
                     continue  # skip this request
 
@@ -446,7 +443,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
 
                 store_mask = torch.ones_like(token_ids, dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
-                print(f"!!!!skip_leading_tokens:{skip_leading_tokens}")
                 logger.info(
                     "Storing KV cache for %d out of %d tokens "
                     "(skip_leading_tokens=%d) for request %s",
@@ -536,7 +532,7 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
                 offset=skip_leading_tokens,
             )
 
-def get_zmq_rpc_path_lmcache(
+def get_zmq_rpc_path_mooncake(
     vllm_config: Optional["VllmConfig"] = None,
 ) -> str:
     base_url = envs.VLLM_RPC_BASE_PATH
@@ -555,7 +551,7 @@ class MooncakeConnectorV1Scheduler:
     def __init__(self, vllm_config: "VllmConfig", skip_last_n_tokens):
         self.client=MooncakeLookupClient(vllm_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-                # request_id -> (vllm cached tokes, lmcache cached tokens)
+                # request_id -> (vllm cached tokes, mooncake cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
         self.skip_last_n_tokens = skip_last_n_tokens
         self._block_size = vllm_config.cache_config.block_size
@@ -606,7 +602,7 @@ class MooncakeConnectorV1Scheduler:
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
         logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
+            "Reqid: %s, Total tokens %d, mooncake hit tokens: %d, need to load: %d",
             request.request_id,
             request.num_tokens,
             num_external_hit_tokens,
@@ -618,7 +614,7 @@ class MooncakeConnectorV1Scheduler:
         
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
-            lmcache_cached_tokens=num_external_hit_tokens,
+            mooncake_cached_tokens=num_external_hit_tokens,
             can_load=False,
         )
         return need_to_allocate, False
@@ -642,11 +638,11 @@ class MooncakeConnectorV1Scheduler:
         assert (
             num_external_tokens > 0
             and num_external_tokens
-            == self.load_specs[request.request_id].lmcache_cached_tokens
+            == self.load_specs[request.request_id].mooncake_cached_tokens
             - self.load_specs[request.request_id].vllm_cached_tokens
         ), (
             f"Mismatch in number of tokens: {num_external_tokens} vs "
-            f"{self.load_specs[request.request_id].lmcache_cached_tokens} - "
+            f"{self.load_specs[request.request_id].mooncake_cached_tokens} - "
             f"{self.load_specs[request.request_id].vllm_cached_tokens}"
             f" for request {request.request_id}"
         )
@@ -716,7 +712,7 @@ class MooncakeLookupClient:
     def __init__(self, vllm_config: "VllmConfig"):
         self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lmcache(vllm_config)
+        socket_path = get_zmq_rpc_path_mooncake(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
@@ -744,7 +740,7 @@ class MooncakeLookupServer:
     ):
         self.decoder = MsgpackDecoder(torch.Tensor)
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lmcache(vllm_config)
+        socket_path = get_zmq_rpc_path_mooncake(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
