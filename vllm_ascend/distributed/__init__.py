@@ -25,3 +25,8 @@ KVConnectorFactory.register_connector(
 KVConnectorFactory.register_connector(
     "AscendSimpleConnector",
     "vllm_ascend.distributed.kv_transfer.simple_connector", "SimpleConnector")
+
+KVConnectorFactory.register_connector(
+    "MooncakeConnectorV1",
+    "vllm_ascend.distributed.mooncake_store_connector_v1",
+    "MooncakeConnectorV1")
