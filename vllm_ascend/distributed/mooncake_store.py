@@ -11,6 +11,15 @@ import ctypes
 import time
 # Third Party
 import torch, torch_npu
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+)
+from vllm.distributed.parallel_state import (get_dp_group,
+                                             get_tensor_model_parallel_rank,
+                                             get_tp_group)
 
 # First Party
 from vllm.utils import logger
@@ -84,7 +93,7 @@ class MooncakeStoreConfig:
 
 class Mooncakestore():
     def __init__(
-        self,
+        self, parallel_config: ParallelConfig
     ):
         try:
             from mooncake.store import MooncakeDistributedStore
@@ -93,10 +102,23 @@ class Mooncakestore():
                 "Please install mooncake by following the instructions at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
                 "to run vLLM with MooncakeConnector.") from e
-
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = parallel_config.tensor_parallel_size
+        self.tp_group = get_tp_group()
+        self.dp_rank = parallel_config.data_parallel_rank_local
+        self.dp_size = parallel_config.data_parallel_size_local  # here we use dp local size
+        
         try:
             device_ids = os.getenv("ASCEND_RT_VISIBLE_DEVICES", None)
             logger.info(f"os getenv ASCEND_RT_VISIBLE_DEVICES: {device_ids}")
+            if device_ids is None:
+                device_ids_list = list(
+                    range(self.dp_rank * self.tp_size,
+                        (self.dp_rank + 1) * self.tp_size))
+            else:
+                device_ids_list = list(map(int, device_ids.split(',')))
+            assert len(device_ids_list) > self.tp_rank
+            self.device_id = device_ids_list[self.tp_rank]
             self.store = MooncakeDistributedStore()
             self.config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded successfully.")
