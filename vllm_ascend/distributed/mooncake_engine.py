@@ -43,20 +43,20 @@ class MoonCakeEngine:
         scheduler_config: SchedulerConfig,
         use_layerwize: bool
     ):
-        use_mla = False
+        self.use_mla = False
         if (
             hasattr(model_config, "use_mla")
             and isinstance(model_config.use_mla, bool)
             and model_config.use_mla
         ):
-            use_mla = True
+            self.use_mla = True
         num_layer = model_config.get_num_layers(parallel_config)
         chunk_size = cache_config.block_size
         num_kv_head = model_config.get_num_kv_heads(parallel_config)
         head_size = model_config.get_head_size()
         kv_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype, model_config.dtype)
         hidden_dim_size = num_kv_head * head_size
-        if use_mla:
+        if self.use_mla:
             kv_shape = (num_layer, 1, chunk_size, 1, head_size)
         else:
             kv_shape = (num_layer, 2, chunk_size, num_kv_head, head_size)
@@ -67,7 +67,7 @@ class MoonCakeEngine:
             kv_dtype,
             kv_shape,
             chunk_size,
-            use_mla,
+            self.use_mla,
         )
 
         self.token_database = ChunkedTokenDatabase(self.metadata)
@@ -125,7 +125,7 @@ class MoonCakeEngine:
             kv_dtype = self.metadata.kv_dtype
             tensor = torch.empty(kv_shape, dtype=kv_dtype) 
             self.npu_transfer.npu_d2h(tensor, start, end, **kwargs)
-            self.m_store.put(key, tensor, kv_shape, kv_dtype)
+            self.m_store.put(key, tensor, kv_shape, kv_dtype, self.use_mla)
         logger.debug(f"Stored {num_stored_tokens} out of total {len(tokens)} tokens")
 
     @torch.inference_mode()
@@ -162,7 +162,7 @@ class MoonCakeEngine:
 
         ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
         for start, end, key in self.token_database.process_tokens(tokens, mask):
-            memory_tensor = self.m_store.get(key)    
+            memory_tensor = self.m_store.get(key, self.use_mla)    
             ret_mask[start:end] = True
             self.npu_transfer.npu_h2d(memory_tensor, start, end, **kwargs)
 
@@ -253,7 +253,7 @@ class MoonCakeEngine:
         for i,keys_multi_chunk in enumerate(keys):
             for index, key in enumerate(keys_multi_chunk):
                 with torch.npu.stream(self.load_stream):
-                    memory_tensor = self.m_store.get(key)
+                    memory_tensor = self.m_store.get(key, self.use_mla)
                     self.npu_transfer.npu_h2d_layer(memory_tensor, starts[index], ends[index], kvcaches[i], **kwargs)
             yield 
 
@@ -346,7 +346,7 @@ class MoonCakeEngine:
                 with torch.npu.stream(self.save_stream):
                     # pass
                     self.npu_transfer.npu_d2h_layer(tensor, req_meta.start, req_meta.end, kvcaches=req_meta.kvcache, slot_mapping=req_meta.slot_mapping)
-                    self.m_store.put(req_meta.key, tensor, kv_shape, kv_dtype)
+                    self.m_store.put(req_meta.key, tensor, kv_shape, kv_dtype, self.use_mla)
             self.save_stream.synchronize()
 
     def wait_layer_transfer_finish(self):
