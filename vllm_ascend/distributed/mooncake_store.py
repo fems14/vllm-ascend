@@ -122,7 +122,7 @@ class Mooncakestore():
     def exists(self, key: MoonCakeEngineKey) -> bool:
         return self.store.is_exist(key.to_string())
 
-    def get(self, key: MoonCakeEngineKey) -> Optional[torch.Tensor]:  #to be amend
+    def get(self, key: MoonCakeEngineKey, , use_mla:bool) -> Optional[torch.Tensor]:  #to be amend
         key_str = key.to_string()
         try:
             buffer = self.store.get_buffer(key_str)
@@ -130,28 +130,48 @@ class Mooncakestore():
             logger.error(f"Failed to get key {key_str}. {e}")
         if buffer is None:
             return None
+        if use_mla:
+            retrieved_view = memoryview(buffer)   
+            metadata_bytes = retrieved_view[:16]
+            if metadata_bytes is None or len(metadata_bytes) != 16:
+                return None
 
-        retrieved_view = memoryview(buffer)   
-        metadata_bytes = retrieved_view[:METADATA_BYTES_LEN]
-        if metadata_bytes is None or len(metadata_bytes) != METADATA_BYTES_LEN:
-            return None
+            length, dtype, shape0, shape1 = struct.unpack_from(
+                "iiii", metadata_bytes
+            ) 
+            
+            shape=torch.Size([shape0, shape1])
 
-        length, dtype, shape0, shape1, shape2, shape3 = struct.unpack_from(
-            "iiiiii", metadata_bytes
-        ) 
-         
-        shape=torch.Size([shape0, shape1, shape2, shape3])
-
-        num_elements = reduce(operator.mul, shape)
-        temp_tensor = torch.frombuffer(
-                buffer,
-                dtype=INT_TO_DTYPE[dtype],
-                offset=METADATA_BYTES_LEN,
-                count=num_elements,
-            ).reshape(shape)
+            num_elements = reduce(operator.mul, shape)
+            temp_tensor = torch.frombuffer(
+                    buffer,
+                    dtype=INT_TO_DTYPE[dtype],
+                    offset=16,
+                    count=num_elements,
+                ).reshape(shape)
+        else:
+            retrieved_view = memoryview(buffer)   
+            metadata_bytes = retrieved_view[:METADATA_BYTES_LEN]
+            if metadata_bytes is None or len(metadata_bytes) != METADATA_BYTES_LEN:
+                return None
+    
+            length, dtype, shape0, shape1, shape2, shape3 = struct.unpack_from(
+                "iiiiii", metadata_bytes
+            ) 
+             
+            shape=torch.Size([shape0, shape1, shape2, shape3])
+    
+            num_elements = reduce(operator.mul, shape)
+            temp_tensor = torch.frombuffer(
+                    buffer,
+                    dtype=INT_TO_DTYPE[dtype],
+                    offset=METADATA_BYTES_LEN,
+                    count=num_elements,
+                ).reshape(shape)
+            
         return temp_tensor
 
-    def put(self, key: MoonCakeEngineKey, memory_tebsor: torch.Tensor, shape:torch.Size, dtype:torch.dtype):   #to be amend
+    def put(self, key: MoonCakeEngineKey, memory_tebsor: torch.Tensor, shape:torch.Size, dtype:torch.dtype, , use_mla:bool):   #to be amend
         num_bytes = memory_tebsor.numel() * memory_tebsor.element_size()
         ptr = memory_tebsor.data_ptr()
         ubyte_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
@@ -159,16 +179,25 @@ class Mooncakestore():
             ctypes.addressof(ubyte_ptr.contents)
         )
         kv_bytes=memoryview(byte_array)
-        metadata_bytes=struct.pack(
-            "iiiiii",
-            len(kv_bytes),
-            DTYPE_TO_INT[dtype],
-            shape[0],
-            shape[1],
-            shape[2],
-            shape[3],
-        )
-        assert len(metadata_bytes) == METADATA_BYTES_LEN
+        if use_mla:
+            metadata_bytes=struct.pack(
+                "iiii",
+                len(kv_bytes),
+                DTYPE_TO_INT[dtype],
+                shape[0],
+                shape[1],
+            )
+        else:
+            metadata_bytes=struct.pack(
+                "iiiiii",
+                len(kv_bytes),
+                DTYPE_TO_INT[dtype],
+                shape[0],
+                shape[1],
+                shape[2],
+                shape[3],
+            )
+        # assert len(metadata_bytes) == METADATA_BYTES_LEN
         key_str = key.to_string()
         try:
             self.store.put_parts(key_str, metadata_bytes, kv_bytes)
