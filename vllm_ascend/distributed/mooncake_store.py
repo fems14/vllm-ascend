@@ -123,7 +123,7 @@ class Mooncakestore():
             self.config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded successfully.")
             if self.config.protocol == 'ascend':
-                self.config.local_hostname = self.config.local_hostname+':'+ str(BASE_PORT + int(device_ids)) +':'+'npu_'+ str(device_ids)
+                self.config.local_hostname = self.config.local_hostname+':'+ str(BASE_PORT + int(self.device_id)) +':'+'npu_'+ str(self.device_id)
             else:
                 self.config.local_hostname = self.config.local_hostname
             self.store.setup(self.config.local_hostname,
