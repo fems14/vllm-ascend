@@ -122,7 +122,7 @@ class Mooncakestore():
     def exists(self, key: MoonCakeEngineKey) -> bool:
         return self.store.is_exist(key.to_string())
 
-    def get(self, key: MoonCakeEngineKey, , use_mla:bool) -> Optional[torch.Tensor]:  #to be amend
+    def get(self, key: MoonCakeEngineKey, use_mla:bool) -> Optional[torch.Tensor]:  #to be amend
         key_str = key.to_string()
         try:
             buffer = self.store.get_buffer(key_str)
@@ -171,7 +171,7 @@ class Mooncakestore():
             
         return temp_tensor
 
-    def put(self, key: MoonCakeEngineKey, memory_tebsor: torch.Tensor, shape:torch.Size, dtype:torch.dtype, , use_mla:bool):   #to be amend
+    def put(self, key: MoonCakeEngineKey, memory_tebsor: torch.Tensor, shape:torch.Size, dtype:torch.dtype, use_mla:bool):   #to be amend
         num_bytes = memory_tebsor.numel() * memory_tebsor.element_size()
         ptr = memory_tebsor.data_ptr()
         ubyte_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
