@@ -19,7 +19,7 @@ from vllm.config import (
 )
 from vllm_ascend.distributed.config_data import MoonCakeEngineKey, MoonCakeEngineMetadata, ChunkedTokenDatabase, LayerMoonCakeEngineKey
 from vllm_ascend.distributed.mooncake_store import Mooncakestore
-from vllm_ascend.distributed.mooncake_store_npu import PagedMemNPUConnector， PagedMemNPUConnectorMLA
+from vllm_ascend.distributed.mooncake_store_npu import PagedMemNPUConnector, PagedMemNPUConnectorMLA
 # First Party
 
 
