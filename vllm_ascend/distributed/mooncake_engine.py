@@ -72,7 +72,7 @@ class MoonCakeEngine:
 
         self.token_database = ChunkedTokenDatabase(self.metadata)
 
-        self.m_store = Mooncakestore()
+        self.m_store = Mooncakestore(parallel_config)
 
         if self.use_mla:
             self.npu_transfer=PagedMemNPUConnectorMLA(hidden_dim_size, num_layer, self.m_store)
