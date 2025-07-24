@@ -376,7 +376,6 @@ class PagedMemNPUConnectorMLA(NPUConnectorInterface):
 
         kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        print("memory_tensor.shape:", memory_tensor.shape)
         self.multi_layer_kv_transfer_py_mla(
             memory_tensor, 
             kvcaches, 
@@ -411,7 +410,6 @@ class PagedMemNPUConnectorMLA(NPUConnectorInterface):
 
         kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        print("memory_tensor.shape:", memory_tensor.shape)
         self.multi_layer_kv_transfer_py_mla(
             memory_tensor, 
             kvcaches, 
