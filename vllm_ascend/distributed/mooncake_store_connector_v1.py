@@ -475,7 +475,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         
         self.save_layer = 0
         if self.use_layerwise:
-            self.connector_worker.wait_layer_transfer_finish()
             return
         
         connector_metadata = self._get_connector_metadata()
