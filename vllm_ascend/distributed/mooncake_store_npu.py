@@ -418,6 +418,77 @@ class PagedMemNPUConnectorMLA(NPUConnectorInterface):
         )
         torch.npu.synchronize()
         
+    def npu_h2d_layer(self, memory_tensor: torch.Tensor, start: int, end: int, kvcache:List[torch.Tensor], **kwargs):
+        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
+        The kvcaches should correspond to the "WHOLE token sequence".
+
+        Note:
+          1. This function expects the 'slot_mapping' is a "full slot mapping"
+             where it's length is the same as the whole token sequence.
+          2. In the case that there is prefix caching, slot_mapping will starts
+             with -1s until the end of the matched prefix. The start and end
+             should NEVER overlap with the prefix caching (which means the
+             underlying CUDA kernel will never see -1 in slot_mapping)
+
+
+        :raises ValueError: If 'kvcaches' is not provided in kwargs.
+        :raises AssertionError: If the memory object does not have a tensor.
+        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        """
+        assert memory_tensor is not None
+
+        # if "kvcaches" not in kwargs:
+        #     raise ValueError("'kvcaches' should be provided in kwargs.")
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        # kvcaches: torch.Tensor = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        self.layer_kv_transfer_py_mla(
+            memory_tensor,
+            kvcache,
+            slot_mapping[start:end],
+            direction=False
+        )
+    
+    def npu_d2h_layer(self, memory_tensor: torch.Tensor, start: int, end: int, **kwargs):
+        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
+        The kvcaches should correspond to the "WHOLE token sequence".
+
+        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2LTD.
+
+        Note:
+          1. This function expects the 'slot_mapping' is a "full slot mapping"
+             where it's length is the same as the whole token sequence.
+          2. In the case that there is prefix caching, slot_mapping will starts
+             with -1s until the end of the matched prefix. The start and end
+             should NEVER overlap with the prefix caching (which means the
+             underlying CUDA kernel will never see -1 in slot_mapping)
+
+        :raises ValueError: If 'kvcaches' is not provided in kwargs,
+        :raises AssertionError: If the memory object does not have a tensor.
+        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        """
+        assert memory_tensor is not None
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches: torch.Tensor = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        
+        # torch.npu.synchronize()
+        # st=time.time()
+        self.layer_kv_transfer_py_mla(
+            memory_tensor,
+            kvcaches,
+            slot_mapping[start:end],
+            direction=True
+        )
+        
     def multi_layer_kv_transfer_py_mla(
         self,
         key_value: torch.Tensor,          # [1, num_layers, num_tokens, scalars_per_token] [1,27,15,576] 
@@ -468,5 +539,49 @@ class PagedMemNPUConnectorMLA(NPUConnectorInterface):
                     self.store.store.d2h(kv_cache_ptr, kv_ptr, num_tokens_len)
                 else:
                     self.store.store.h2d(kv_cache_ptr, kv_ptr, num_tokens_len)
+    
+    def layer_kv_transfer_py_mla(
+        self,
+        key_value: torch.Tensor,          # [2, num_layers, num_tokens, scalars_per_token]
+        kv_caches: List[torch.Tensor],          # [2,block_num,block_size,num_heads, head_size]
+        slot_mapping: torch.Tensor,       # [num_tokens]
+        direction: bool, 
+    ):
+       
+        num_tokens = slot_mapping.shape[0]
+        scalars_per_token = key_value.shape[-1]
+
+        k_per_token = kv_caches[0].size(3)
+        v_per_token = kv_caches[1].size(3)
+
+        flat_key_value = key_value.view(-1)
+        flat_kv_ptrs =[ptr.view(-1) for ptr in kv_caches]  # layer_kv: [K_tensor, V_tensor]
+
+        slot_idx = slot_mapping[0].item()
+        if slot_idx < 0:
+            raise  # skip invalid slots
+        for k_or_v in [0, 1]:  # 0=Key, 1=Values
+            if k_or_v == 0:
+                kv_cache_offset = slot_idx * k_per_token
+                kv_ptr=flat_key_value[0 : 1].data_ptr()
+                kv_cache_ptr=flat_kv_ptrs[k_or_v][kv_cache_offset : kv_cache_offset+1].data_ptr()
+                num_tokens_len = k_per_token*flat_key_value.element_size()*num_tokens
+            elif k_or_v == 1:
+                kv_offset = (
+                    num_tokens * k_per_token
+                )
+                kv_cache_offset = slot_idx * v_per_token
+                kv_ptr=flat_key_value[kv_offset : kv_offset+1].data_ptr()
+                kv_cache_ptr=flat_kv_ptrs[k_or_v][kv_cache_offset : kv_cache_offset+1].data_ptr()
+                num_tokens_len = v_per_token*flat_key_value.element_size()*num_tokens
+        
+            if direction:
+                self.store.store.d2h(kv_cache_ptr, kv_ptr, num_tokens_len)
+            else:
+                self.store.store.h2d(kv_cache_ptr, kv_ptr, num_tokens_len)
+
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size([1, self.num_layers*num_tokens*self.hidden_dim_size])
+
+    def get_layer_shape(self, num_tokens: int) -> torch.Size:
+        return torch.Size([1, 1*num_tokens*self.hidden_dim_size])
