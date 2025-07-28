@@ -82,6 +82,9 @@ class MoonCakeEngine:
         if use_layerwize:
             self.load_stream = torch.npu.Stream()
             self.save_stream = torch.npu.Stream()
+            self.save_input_queue: queue.Queue[list[LasyerBlockReqMeta]] = queue.Queue()
+            self.save_thread = threading.Thread(target=self._save_listener)
+            self.save_thread.start()
             self.num_layers = num_layer
 
     @torch.inference_mode()
@@ -318,16 +321,37 @@ class MoonCakeEngine:
     ) -> Generator[None, None, None]:
         kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        kv_dtype = self.metadata.kv_dtype
         for i,keys_multi_chunk in enumerate(keys):
-            torch.npu.current_stream().synchronize()
+            req_meta_list:list[LasyerBlockReqMeta]=[]
             for index, key in enumerate(keys_multi_chunk):
-                kv_shape = self.npu_transfer.get_layer_shape(ends[index]-starts[index])
-                tensor = torch.empty(kv_shape, dtype=kv_dtype)
-                with torch.npu.stream(self.save_stream):
-                    self.npu_transfer.npu_d2h_layer(tensor, starts[index], ends[index], kvcaches=kvcaches[i], slot_mapping=slot_mapping)
-                    self.m_store.put(key, tensor, kv_shape, kv_dtype, self.use_mla)
+                req_meta=LasyerBlockReqMeta(
+                    key,
+                    kvcaches[i],
+                    starts[index],
+                    ends[index],
+                    slot_mapping
+                )
+                req_meta_list.append(req_meta)
+            self.save_input_queue.put(req_meta_list)
             yield 
+
+    def _save_listener(self):
+        kv_dtype = self.metadata.kv_dtype
+        while True:
+            req_meta_list = self.save_input_queue.get()
+            for req_meta in req_meta_list:
+	        torch.npu.current_stream().synchronize()
+                num_tokens=req_meta.end-req_meta.start
+                kv_shape = self.npu_transfer.get_layer_shape(num_tokens)
+                tensor = torch.empty(kv_shape, dtype=kv_dtype) 
+                with torch.npu.stream(self.save_stream):
+                    self.npu_transfer.npu_d2h_layer(tensor, req_meta.start, req_meta.end, kvcaches=req_meta.kvcache, slot_mapping=req_meta.slot_mapping)
+                    self.m_store.put(req_meta.key, tensor, kv_shape, kv_dtype)
+
+    def wait_layer_transfer_finish(self):
+        while not self.save_input_queue.empty():
+            time.sleep(0.0000001)
+        self.save_stream.synchronize()
 
     def lookup(
         self,
