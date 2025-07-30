@@ -99,3 +99,8 @@ curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json"
 #### 提示
 
 上述所有步骤中的文件路径需写成文件实际路径，模型也要配置为模型实际所在路径
+
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
+cp mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so /usr/local/Ascend/ascend-toolkit/latest/python/site-packages/
+
+
