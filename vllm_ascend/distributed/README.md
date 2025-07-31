@@ -104,3 +104,11 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packa
 cp mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so /usr/local/Ascend/ascend-toolkit/latest/python/site-packages/
 
 
+
+--tensor-parallel-size 2\
+    --data-parallel-size 2 \
+    --data-parallel-size-local 2 \
+    --data-parallel-address 141.61.41.83 \
+    --data-parallel-rpc-port 9200 \
+
+
