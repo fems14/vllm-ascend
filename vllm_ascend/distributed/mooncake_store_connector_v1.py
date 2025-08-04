@@ -580,8 +580,6 @@ class MooncakeConnectorV1Scheduler:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        if self.kv_role == "kv_producer":
-            return 0, False
 
         token_ids = torch.tensor(request.prompt_token_ids)
         if self.skip_last_n_tokens > 0:
