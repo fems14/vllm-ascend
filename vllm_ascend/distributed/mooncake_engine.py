@@ -340,7 +340,7 @@ class MoonCakeEngine:
         while True:
             req_meta_list = self.save_input_queue.get()
             for req_meta in req_meta_list:
-	        torch.npu.current_stream().synchronize()
+	            torch.npu.current_stream().synchronize()
                 num_tokens=req_meta.end-req_meta.start
                 kv_shape = self.npu_transfer.get_layer_shape(num_tokens)
                 tensor = torch.empty(kv_shape, dtype=kv_dtype) 
