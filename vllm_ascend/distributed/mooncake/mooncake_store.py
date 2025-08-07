@@ -24,7 +24,7 @@ from vllm.distributed.parallel_state import (get_dp_group,
 # First Party
 from vllm.utils import logger
 from vllm.config import VllmConfig
-from vllm_ascend.distributed.config_data import MoonCakeEngineKey
+from vllm_ascend.distributed.mooncake.config_data import MoonCakeEngineKey
 
 METADATA_BYTES_LEN = 24
 BASE_PORT = int(os.getenv("VLLM_BASE_PORT", "8790"))
