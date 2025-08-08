@@ -93,20 +93,41 @@ class RequestTracker:
             num_saved_tokens=0,
         )
 
+    # def update(
+    #     self,
+    #     cached_request: "CachedRequestData",
+    # ) -> None:
+    #     """Update the request tracker when a running request is
+    #     scheduled again
+    #     """
+    #     self.token_ids.extend(cached_request.new_token_ids)
+    #     new_block_ids: list[int]
+    #     if not isinstance(cached_request.new_block_ids[0], list):
+    #         new_block_ids = cached_request.new_block_ids
+    #     else:
+    #         new_block_ids = cached_request.new_block_ids[0]
+    #     self.allocated_block_ids.extend(new_block_ids)
     def update(
         self,
-        cached_request: "CachedRequestData",
+        new_token_ids: list[int],
+        new_block_ids: Union[tuple[list[int], ...], list[int]],
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
         """
-        self.token_ids.extend(cached_request.new_token_ids)
-        new_block_ids: list[int]
-        if not isinstance(cached_request.new_block_ids[0], list):
-            new_block_ids = cached_request.new_block_ids
+
+        self.token_ids.extend(new_token_ids)
+
+        if len(new_block_ids) == 0:
+            new_block_ids = []
+        elif isinstance(new_block_ids, tuple):
+            new_block_ids = new_block_ids[0]
+        elif isinstance(new_block_ids, list):
+            pass
         else:
-            new_block_ids = cached_request.new_block_ids[0]
+            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
         self.allocated_block_ids.extend(new_block_ids)
+
 
 @dataclass
 class ReqMeta:
@@ -560,6 +581,7 @@ class MooncakeConnectorV1Scheduler:
                 "discard_partial_chunks", False
             )
         )
+        self._unfinished_requests: dict[str, Request] = {}
     
     def get_num_new_matched_tokens(
         self,
@@ -643,6 +665,7 @@ class MooncakeConnectorV1Scheduler:
         )
 
         self.load_specs[request.request_id].can_load = True
+        self._unfinished_requests[request.request_id] = request
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -663,6 +686,7 @@ class MooncakeConnectorV1Scheduler:
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
+            self._unfinished_requests.pop(finished_req_id, None)
 
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
@@ -686,20 +710,63 @@ class MooncakeConnectorV1Scheduler:
             if req_meta is not None:
                 meta.add_request(req_meta)
 
-        for request in scheduler_output.scheduled_cached_reqs:
-            request_tracker = self._request_trackers[request.req_id]
-            request_tracker.update(request)
+        # for request in scheduler_output.scheduled_cached_reqs:
+        #     request_tracker = self._request_trackers[request.req_id]
+        #     request_tracker.update(request)
 
-            req_meta = ReqMeta.from_request_tracker(
-                request_tracker,
-                self._block_size,
-                load_spec=None,
-                skip_save=force_skip_save,
-                discard_partial_chunks=self._discard_partial_chunks,
-            )
-            if req_meta is not None:
-                meta.add_request(req_meta)
+        #     req_meta = ReqMeta.from_request_tracker(
+        #         request_tracker,
+        #         self._block_size,
+        #         load_spec=None,
+        #         skip_save=force_skip_save,
+        #         discard_partial_chunks=self._discard_partial_chunks,
+        #     )
+        #     if req_meta is not None:
+        #         meta.add_request(req_meta)
+        
+        # NOTE: For backward compatibility with vllm version < 0.9.2,
+        # In the latest vllm version, the type of scheduled_cached_reqs has
+        # changed from list to object `CachedRequestData`
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        if isinstance(cached_reqs, list):
+            for i, req in enumerate(cached_reqs):
+                request_tracker = self._request_trackers[req.req_id]
+                request_tracker.update(req.new_token_ids, req.new_block_ids)
 
+                req_meta = ReqMeta.from_request_tracker(
+                    request_tracker,
+                    self._block_size,
+                    load_spec=None,
+                    skip_save=force_skip_save,
+                    discard_partial_chunks=self._discard_partial_chunks,
+                )
+                if req_meta is not None:
+                    meta.add_request(req_meta)
+        else:
+            for i, req_id in enumerate(cached_reqs.req_ids):
+                request_tracker = self._request_trackers[req_id]
+                num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                if request := self._unfinished_requests.get(req_id):
+                    num_current_tokens = len(request_tracker.token_ids)
+                    new_token_ids = request.all_token_ids[
+                        num_current_tokens : num_current_tokens + num_new_tokens
+                    ]
+                else:
+                    raise ValueError(
+                        f"Request {req_id} is not in _unfinished_requests, "
+                        f"but it is scheduled to be cached"
+                    )
+                new_block_ids = cached_reqs.new_block_ids[i]
+                request_tracker.update(new_token_ids, new_block_ids)
+                req_meta = ReqMeta.from_request_tracker(
+                    request_tracker,
+                    self._block_size,
+                    load_spec=None,
+                    skip_save=force_skip_save,
+                    discard_partial_chunks=self._discard_partial_chunks,
+                )
+                if req_meta is not None:
+                    meta.add_request(req_meta)
         return meta
 
 
