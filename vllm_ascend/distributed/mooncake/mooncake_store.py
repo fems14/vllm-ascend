@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from functools import reduce
 from typing import List, Optional, no_type_check
+from enum import Enum
 import asyncio
 import json
 import operator
@@ -29,66 +30,12 @@ from vllm_ascend.distributed.mooncake.config_data import MoonCakeEngineKey
 METADATA_BYTES_LEN = 24
 BASE_PORT = int(os.getenv("VLLM_BASE_PORT", "8790"))
 
-DTYPE_TO_INT = {
-    None: 0,
-    torch.half: 1,
-    torch.float16: 2,
-    torch.bfloat16: 3,
-    torch.float: 4,
-    torch.float32: 4,
-    torch.float64: 5,
-    torch.double: 5,
-    torch.uint8: 6,
-    torch.float8_e4m3fn: 7,
-    torch.float8_e5m2: 8,
-}
 
-INT_TO_DTYPE = {
-    0: None,
-    1: torch.half,
-    2: torch.float16,
-    3: torch.bfloat16,
-    4: torch.float,
-    5: torch.float64,
-    6: torch.uint8,
-    7: torch.float8_e4m3fn,
-    8: torch.float8_e5m2,
-}
-
-@dataclass
-class MooncakeStoreConfig:
-    local_hostname: str
-    metadata_server: str
-    global_segment_size: int
-    local_buffer_size: int
-    protocol: str
-    device_name: str
-    master_server_address: str
-
-    @staticmethod
-    def from_file(file_path: str) -> "MooncakeStoreConfig":
-        """Load the config from a JSON file."""
-        with open(file_path) as fin:
-            config = json.load(fin)
-        return MooncakeStoreConfig(
-            local_hostname=config.get("local_hostname"),
-            metadata_server=config.get("metadata_server"),
-            global_segment_size=config.get("global_segment_size", 3355443200),
-            local_buffer_size=config.get("local_buffer_size", 1073741824),
-            protocol=config.get("protocol", "tcp"),
-            device_name=config.get("device_name", ""),
-            master_server_address=config.get("master_server_address"),
-        )
-
-    @staticmethod
-    def load_from_env() -> "MooncakeStoreConfig":
-        """Load config from a file specified in the environment variable."""
-        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
-        if config_file_path is None:
-            raise ValueError(
-                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
-            )
-        return MooncakeStoreConfig.from_file(config_file_path)
+class MmcDirect(Enum):
+    COPY_L2G = 0
+    COPY_G2L = 1
+    COPY_G2H = 2
+    COPY_H2G = 3
 
 
 class Mooncakestore():
@@ -96,43 +43,20 @@ class Mooncakestore():
         self, parallel_config: ParallelConfig
     ):
         try:
-            from mooncake.store import MooncakeDistributedStore
+            from pymmc import DistributedObjectStore
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
                 "to run vLLM with MooncakeConnector.") from e
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = parallel_config.tensor_parallel_size
-        self.tp_group = get_tp_group()
-        self.dp_rank = parallel_config.data_parallel_rank_local
-        self.dp_size = parallel_config.data_parallel_size_local  # here we use dp local size
-        
         try:
-            device_ids = os.getenv("ASCEND_RT_VISIBLE_DEVICES", None)
-            logger.info(f"os getenv ASCEND_RT_VISIBLE_DEVICES: {device_ids}")
-            if device_ids is None:
-                device_ids_list = list(
-                    range(self.dp_rank * self.tp_size,
-                        (self.dp_rank + 1) * self.tp_size))
-            else:
-                device_ids_list = list(map(int, device_ids.split(',')))
-            assert len(device_ids_list) > self.tp_rank
-            self.device_id = device_ids_list[self.tp_rank]
-            self.store = MooncakeDistributedStore()
-            self.config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded successfully.")
-            if self.config.protocol == 'ascend':
-                self.config.local_hostname = self.config.local_hostname+':'+ str(BASE_PORT + int(self.device_id)) +':'+'npu_'+ str(self.device_id)
-            else:
-                self.config.local_hostname = self.config.local_hostname
-            self.store.setup(self.config.local_hostname,
-                             self.config.metadata_server,
-                             self.config.global_segment_size,
-                             self.config.local_buffer_size,
-                             self.config.protocol, self.config.device_name,
-                             self.config.master_server_address)
-
+            self.rank = parallel_config.rank
+            self.dp_rank = parallel_config.data_parallel_rank
+            self.dp_size = parallel_config.data_parallel_size
+            self.local_rank = self.dp_rank * self.dp_size + self.rank
+            self.store = DistributedObjectStore()
+            res = self.store.init(self.rank)
+            assert res==0
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
@@ -144,96 +68,21 @@ class Mooncakestore():
     def exists(self, key: MoonCakeEngineKey) -> bool:
         return self.store.is_exist(key.to_string())
 
-    def get(self, key: MoonCakeEngineKey, use_mla:bool) -> Optional[torch.Tensor]:  #to be amend
+    def get(self, key: MoonCakeEngineKey, addr: list[int], size: list[int]):
         key_str = key.to_string()
         try:
-            buffer = self.store.get_buffer(key_str)
+            self.store.get_into_layers(key.to_string(), addr, size, MmcDirect.COPY_G2L.value)
         except Exception as e:
             logger.error(f"Failed to get key {key_str}. {e}")
-        if buffer is None:
-            return None
-        if use_mla:
-            retrieved_view = memoryview(buffer)   
-            metadata_bytes = retrieved_view[:16]
-            if metadata_bytes is None or len(metadata_bytes) != 16:
-                return None
 
-            length, dtype, shape0, shape1 = struct.unpack_from(
-                "iiii", metadata_bytes
-            ) 
-            
-            shape=torch.Size([shape0, shape1])
-
-            num_elements = reduce(operator.mul, shape)
-            temp_tensor = torch.frombuffer(
-                    buffer,
-                    dtype=INT_TO_DTYPE[dtype],
-                    offset=16,
-                    count=num_elements,
-                ).reshape(shape)
-        else:
-            retrieved_view = memoryview(buffer)   
-            metadata_bytes = retrieved_view[:METADATA_BYTES_LEN]
-            if metadata_bytes is None or len(metadata_bytes) != METADATA_BYTES_LEN:
-                return None
-    
-            length, dtype, shape0, shape1, shape2, shape3 = struct.unpack_from(
-                "iiiiii", metadata_bytes
-            ) 
-             
-            shape=torch.Size([shape0, shape1, shape2, shape3])
-    
-            num_elements = reduce(operator.mul, shape)
-            temp_tensor = torch.frombuffer(
-                    buffer,
-                    dtype=INT_TO_DTYPE[dtype],
-                    offset=METADATA_BYTES_LEN,
-                    count=num_elements,
-                ).reshape(shape)
-            
-        return temp_tensor
-
-    def put(self, key: MoonCakeEngineKey, memory_tebsor: torch.Tensor, shape:torch.Size, dtype:torch.dtype, use_mla:bool):   #to be amend
-        num_bytes = memory_tebsor.numel() * memory_tebsor.element_size()
-        ptr = memory_tebsor.data_ptr()
-        ubyte_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
-        byte_array = (ctypes.c_ubyte * num_bytes).from_address(
-            ctypes.addressof(ubyte_ptr.contents)
-        )
-        kv_bytes=memoryview(byte_array)
-        if use_mla:
-            metadata_bytes=struct.pack(
-                "iiii",
-                len(kv_bytes),
-                DTYPE_TO_INT[dtype],
-                shape[0],
-                shape[1],
-            )
-        else:
-            metadata_bytes=struct.pack(
-                "iiiiii",
-                len(kv_bytes),
-                DTYPE_TO_INT[dtype],
-                shape[0],
-                shape[1],
-                shape[2],
-                shape[3],
-            )
-        # assert len(metadata_bytes) == METADATA_BYTES_LEN
-        key_str = key.to_string()
+    def put(self, key: MoonCakeEngineKey, addr: list[int], size: list[int]):
         try:
-            self.store.put_parts(key_str, metadata_bytes, kv_bytes)
+            self.store.put_from_layers(key.to_string(), addr, size, MmcDirect.COPY_L2G.value)
         except Exception as e:
             logger.error(
-                f"Failed to put key {key_str},"
-                f"meta type: {type(metadata_bytes)},"
-                f"data: {type(kv_bytes)}: {e}"
+                f"Failed to put key {key.to_string()},error:{e}"
             )
-
-    @no_type_check
-    def list(self) -> List[str]:
-        pass
-
+    
     def close(self):
         self.store.close()
         logger.info("Closed the mooncake store connection")
