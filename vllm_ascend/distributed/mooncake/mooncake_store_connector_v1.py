@@ -218,10 +218,10 @@ class MooncakeConnectorV1Scheduler:
         else:
             num_external_hit_tokens = self.client.lookup(token_ids)
 
-        When prompt length is divisible by the block size and all
-        blocks are cached, we need to recompute the last token.
-        This will be removed in the future if vLLM's scheduler provides
-        a better support for this case.
+        # When prompt length is divisible by the block size and all
+        # blocks are cached, we need to recompute the last token.
+        # This will be removed in the future if vLLM's scheduler provides
+        # a better support for this case.
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
 
