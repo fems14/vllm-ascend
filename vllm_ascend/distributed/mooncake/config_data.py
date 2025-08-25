@@ -2,13 +2,13 @@
 from dataclasses import dataclass
 import hashlib
 from typing import Any, Iterable, List, Optional, Tuple, Union
-import os
-import re
 
 # Third Party
 from numpy import array
 import torch, torch_npu
-import yaml
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.utils import logger
+from vllm.utils import cdiv
 
 # First Party
 
@@ -236,3 +236,358 @@ class ChunkedTokenDatabase():
                     yield start_idx, end_idx, self._make_key_by_hash(hash_val)
                 else:
                     yield start_idx, end_idx, hash_val
+
+
+# class MultiChunkedTokenDatabase():
+#     def __init__(
+#         self,
+#         metadata: Optional[MoonCakeEngineMetadata] = None,
+#     ):
+#         self.metadata = metadata
+
+#     def _make_key_by_hash(self, chunk_hash: str, layer_id: Optional[int] = None):
+#         assert self.metadata is not None
+#         return MoonCakeEngineKey(
+#             self.metadata.model_name,
+#             self.metadata.world_size,
+#             self.metadata.worker_id,
+#             chunk_hash,
+#         )
+
+#     def _hash(
+#         self,
+#         tokens: Union[torch.Tensor, List[int]],
+#         prefix_hash: str,
+#     ) -> str:
+#         # TODO: change it to a more efficient hash function
+#         if isinstance(tokens, torch.Tensor):
+#             tokens_bytes = tokens.cpu().to(torch.uint32).numpy().tobytes()
+#         elif isinstance(tokens, list):
+#             tokens_bytes = array.array("I", tokens).tobytes()
+#         return hashlib.sha256(prefix_hash.encode("ascii") + tokens_bytes).hexdigest()
+
+#     def _chunk_tokens(
+#         self,
+#         tokens: Union[torch.Tensor, List[int]],
+#     ):
+#         """
+#         Chunk the tokens into chunks of size self.metadata.block_size.
+
+#         :param tokens: the input tokens, with shape [seq_len]
+#             device: the target device after chunking
+
+#         :return: a generator of chunks of tokens, each with
+#                 shape [metadata.block_size]
+#         """
+#         tokens_list=[]
+#         for i in range(0, len(tokens), self.metadata.block_size):
+#             tokens_list.append(tokens[i : i + self.metadata.block_size])
+
+#     def _prefix_hash(
+#         self,
+#         token_chunks: List[Union[torch.Tensor, List[int]]],
+#     ):
+#         hashs=[]
+#         prefix_hash = ''
+#         for token_chunk in token_chunks:
+#             prefix_hash = self._hash(token_chunk, prefix_hash)
+#             hashs.append(prefix_hash)
+
+
+#     def process_tokens(
+#         self,
+#         tokens: Union[torch.Tensor, List[int]],
+#         mask: Optional[torch.Tensor] = None,
+#         make_key: bool = True,
+#     ):
+#         """Process the tokens and return the corresponding cache engine keys.
+
+#         :param Union[torch.Tensor, List[int]] tokens: The tokens to process.
+
+#         :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+#             have the same length as tokens. And the mask should ALWAYS be like
+#             FFFFFTTTTTTT, where True means the tokens needs to be matched,
+#             and the Falses will ALWAYS be at the PREFIX of the tensor.
+
+#         :param bool make_key: Whether to make the cache engine key or not.
+#             If False, the hash value will be returned instead.
+
+#         :returns: A iterable of tuples with three elements. The first element
+#             is the start index of the tokens for the key. The second element
+#             is the end index of the tokens for the key. The third element is
+#             the cache engine key (or hash) for the tokens.
+
+#         :raises: ValueError if the number of Falses in the mask is not a
+#             multiple of the chunk size.
+#         """
+#         if mask is not None:
+#             num_falses = mask.numel() - mask.long().sum().item()
+#         else:
+#             num_falses = 0
+
+#         if num_falses % self.metadata.block_size != 0:
+#             raise ValueError(
+#                 "The number of Falses in the mask is not a multiple of the chunk size."
+#             )
+#         total_len = len(tokens)
+
+#         token_chunks = self._chunk_tokens(tokens)
+#         prefix_hashes = self._prefix_hash(token_chunks)
+
+#         start_idx = 0
+#         starts=[]
+#         ends=[]
+#         keys=[]
+#         for chunk_id, hash_val in enumerate(prefix_hashes):
+#             start_idx = chunk_id * self.metadata.block_size
+#             end_idx = min(start_idx + self.metadata.block_size, total_len)
+#             if start_idx < num_falses:
+#                 continue
+#             else:
+#                 if make_key:
+#                     starts.append(start_idx)
+#                     ends.append(end_idx)
+#                     keys.append(self._make_key_by_hash(hash_val))
+#                 else:
+#                     starts.append(start_idx)
+#                     ends.append(end_idx)
+#                     keys.append(hash_val)
+#         return starts, ends, keys
+
+
+@dataclass
+class LoadSpec:
+    # Number of tokens cached in vLLM
+    vllm_cached_tokens: int
+    # Number of tokens that are cached in mooncake
+    mooncake_cached_tokens: int
+    # Whether the scheduler allow us to load the tokens
+    can_load: bool
+
+@dataclass
+class SaveSpec:
+    # Skip already saved tokens
+    skip_leading_tokens: int
+    # Whether the scheduler allow us to save the tokens
+    can_save: bool
+
+@dataclass
+class RequestTracker:
+    # Request id
+    req_id: str
+
+    # The token ids that has been scheduled so far
+    token_ids: list[int]
+
+    # The block ids that has been allocated so far
+    # NOTE: allocated blocks could be more than the number of tokens
+    # FIXME: need to check whether the block ids will be changed after
+    #        preemption
+    allocated_block_ids: list[int]
+
+    # The number of tokens that has been savd
+    num_saved_tokens: int = 0
+
+    @staticmethod
+    def from_new_request(
+        new_request: "NewRequestData",
+        num_tokens_to_compute: int,
+    ) -> "RequestTracker":
+        """Create the request tracker from a new request.
+
+        Args:
+            new_request (NewRequestData): the new request data.
+            num_tokens_to_compute (int): the number of tokens that will
+                be 'computed', including the `num_computed_tokens` (vLLM's
+                local cache hit) and new tokens that will be scheduled.
+
+        """
+        # vLLM 0.9.0 update: request.block_ids changed from list[int] to
+        # list[list[int]]
+        # Need to check the type of request.block_ids
+
+        unfolded_block_ids = []
+
+        if not isinstance(new_request.block_ids[0], list):
+            unfolded_block_ids = new_request.block_ids.copy()
+        else:
+            unfolded_block_ids = new_request.block_ids[0].copy()
+
+        return RequestTracker(
+            req_id=new_request.req_id,
+            token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
+            allocated_block_ids=unfolded_block_ids,
+            num_saved_tokens=0,
+        )
+
+    # def update(
+    #     self,
+    #     cached_request: "CachedRequestData",
+    # ) -> None:
+    #     """Update the request tracker when a running request is
+    #     scheduled again
+    #     """
+    #     self.token_ids.extend(cached_request.new_token_ids)
+    #     new_block_ids: list[int]
+    #     if not isinstance(cached_request.new_block_ids[0], list):
+    #         new_block_ids = cached_request.new_block_ids
+    #     else:
+    #         new_block_ids = cached_request.new_block_ids[0]
+    #     self.allocated_block_ids.extend(new_block_ids)
+    def update(
+        self,
+        new_token_ids: list[int],
+        new_block_ids: Union[tuple[list[int], ...], list[int]],
+    ) -> None:
+        """Update the request tracker when a running request is
+        scheduled again
+        """
+
+        self.token_ids.extend(new_token_ids)
+
+        if len(new_block_ids) == 0:
+            new_block_ids = []
+        elif isinstance(new_block_ids, tuple):
+            new_block_ids = new_block_ids[0]
+        elif isinstance(new_block_ids, list):
+            pass
+        else:
+            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
+        self.allocated_block_ids.extend(new_block_ids)
+
+
+@dataclass
+class ReqMeta:
+    # Request id
+    req_id: str
+    # Request tokens
+    token_ids: torch.Tensor
+    # Slot mapping
+    slot_mapping: torch.Tensor
+    # Skip save or not
+    save_spec: Optional[SaveSpec] = None
+    # load_spec
+    load_spec: Optional[LoadSpec] = None
+
+    @staticmethod
+    def from_request_tracker(
+        tracker: RequestTracker,
+        block_size: int,
+        load_spec: Optional[LoadSpec] = None,
+        skip_save: bool = False,
+        discard_partial_chunks: bool = True,
+    ) -> Optional["ReqMeta"]:
+        """Create the request metadata from a request tracker.
+
+        Args:
+            tracker (RequestTracker): the request tracker.
+            block_size (int): the block size in vLLM.
+            load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
+            skip_save (bool): whether to skip the save operation.
+            discard_partial_chunks (bool): whether to discard partial chunks.
+
+        Returns:
+            the request metadata if we need to perform load/save
+            operations, None otherwise.
+        """
+        input_token_ids = tracker.token_ids
+        input_token_len = len(input_token_ids)
+
+        # For save operation: do not save if the following condition is met
+        # 1. has already been saved before (num_saved_tokens > 0)
+        # 2. number of unsaved tokens is not reached the chunk boundary
+        skip_leading_tokens = tracker.num_saved_tokens
+        chunk_boundary = (
+            cdiv(tracker.num_saved_tokens + 1, block_size) * block_size
+        )
+        skip_save = skip_save or (
+            tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary
+        )
+
+        if skip_save and load_spec is None:
+            return None
+
+        # Calculate number of tokens to save based on discard_partial_chunks
+        # setting
+        num_tokens_to_save = (
+            (input_token_len // block_size * block_size)
+            if discard_partial_chunks
+            else input_token_len
+        )
+
+        # If we need to save, update the number of saved tokens
+        if not skip_save:
+            tracker.num_saved_tokens = num_tokens_to_save
+        save_spec = SaveSpec(skip_leading_tokens, not skip_save)
+
+        # Calculate the token ids and slot mappings for load and save
+        # OPTIMIZATION: pre-allocate the buffer for token ids and block ids
+        token_ids = torch.tensor(input_token_ids)[:num_tokens_to_save]
+        num_blocks = len(tracker.allocated_block_ids)
+        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
+
+        if len(token_ids) > num_blocks * block_size:
+            logger.error(
+                "The number of tokens is more than the number of blocks."
+                "Something might be wrong in scheduling logic!"
+            )
+            logger.error(
+                "Num tokens: %d, num blocks: %d, block size: %d",
+                len(token_ids),
+                num_blocks,
+                block_size,
+            )
+
+        block_offsets = torch.arange(0, block_size, dtype=torch.long)
+        slot_mapping = (
+            block_offsets.reshape((1, block_size))
+            + block_ids.reshape((num_blocks, 1)) * block_size
+        )
+
+        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+
+        # For load operation: check whether the request is scheduled to load
+        if load_spec is not None and load_spec.can_load:
+            logger.debug(
+                "Scheduled to load %d tokens for request %s",
+                load_spec.mooncake_cached_tokens,
+                tracker.req_id,
+            )
+        else:
+            # Do not load if not in `can_load` state
+            load_spec = None
+
+        return ReqMeta(
+            req_id=tracker.req_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            save_spec=save_spec,
+            load_spec=load_spec,
+        )
+
+
+@dataclass
+class MooncakeConnectorMetadata(KVConnectorMetadata):
+    requests: list[ReqMeta]
+
+    def __init__(self):
+        self.requests = []
+
+    def add_request(self, req_meta: ReqMeta) -> None:
+        """Add a request to the metadata.
+
+        Args:
+            req_meta (ReqMeta): the request metadata.
+        """
+        self.requests.append(req_meta)
+
+
+@dataclass
+class LasyerMultiBlockReqMeta:
+    req_id: str
+    keys: List[LayerMoonCakeEngineKey]
+    starts: List[int]
+    ends: list[int]
+    slot_mapping: torch.Tensor
+    layer_id: int
+
