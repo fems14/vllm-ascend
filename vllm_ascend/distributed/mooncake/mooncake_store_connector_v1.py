@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional, Dict, List, Tuple, Union
 import msgspec
 import torch
 import zmq
+import threading
 
 from concurrent.futures import Future
 
@@ -26,233 +27,8 @@ from vllm_ascend.distributed.mooncake.mooncake_engine import MoonCakeEngine
 from vllm.v1.request import Request
 from vllm.forward_context import ForwardContext
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm_ascend.distributed.mooncake.config_data import MooncakeConnectorMetadata,RequestTracker,LoadSpec,ReqMeta
 
-
-@dataclass
-class LoadSpec:
-    # Number of tokens cached in vLLM
-    vllm_cached_tokens: int
-    # Number of tokens that are cached in mooncake
-    mooncake_cached_tokens: int
-    # Whether the scheduler allow us to load the tokens
-    can_load: bool
-
-@dataclass
-class SaveSpec:
-    # Skip already saved tokens
-    skip_leading_tokens: int
-    # Whether the scheduler allow us to save the tokens
-    can_save: bool
-
-@dataclass
-class RequestTracker:
-    # Request id
-    req_id: str
-
-    # The token ids that has been scheduled so far
-    token_ids: list[int]
-
-    # The block ids that has been allocated so far
-    # NOTE: allocated blocks could be more than the number of tokens
-    # FIXME: need to check whether the block ids will be changed after
-    #        preemption
-    allocated_block_ids: list[int]
-
-    # The number of tokens that has been savd
-    num_saved_tokens: int = 0
-
-    @staticmethod
-    def from_new_request(
-        new_request: "NewRequestData",
-        num_tokens_to_compute: int,
-    ) -> "RequestTracker":
-        """Create the request tracker from a new request.
-
-        Args:
-            new_request (NewRequestData): the new request data.
-            num_tokens_to_compute (int): the number of tokens that will
-                be 'computed', including the `num_computed_tokens` (vLLM's
-                local cache hit) and new tokens that will be scheduled.
-
-        """
-        # vLLM 0.9.0 update: request.block_ids changed from list[int] to
-        # list[list[int]]
-        # Need to check the type of request.block_ids
-
-        unfolded_block_ids = []
-
-        if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
-        else:
-            unfolded_block_ids = new_request.block_ids[0].copy()
-
-        return RequestTracker(
-            req_id=new_request.req_id,
-            token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
-            allocated_block_ids=unfolded_block_ids,
-            num_saved_tokens=0,
-        )
-
-    # def update(
-    #     self,
-    #     cached_request: "CachedRequestData",
-    # ) -> None:
-    #     """Update the request tracker when a running request is
-    #     scheduled again
-    #     """
-    #     self.token_ids.extend(cached_request.new_token_ids)
-    #     new_block_ids: list[int]
-    #     if not isinstance(cached_request.new_block_ids[0], list):
-    #         new_block_ids = cached_request.new_block_ids
-    #     else:
-    #         new_block_ids = cached_request.new_block_ids[0]
-    #     self.allocated_block_ids.extend(new_block_ids)
-    def update(
-        self,
-        new_token_ids: list[int],
-        new_block_ids: Union[tuple[list[int], ...], list[int]],
-    ) -> None:
-        """Update the request tracker when a running request is
-        scheduled again
-        """
-
-        self.token_ids.extend(new_token_ids)
-
-        if len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
-        elif isinstance(new_block_ids, list):
-            pass
-        else:
-            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
-        self.allocated_block_ids.extend(new_block_ids)
-
-
-@dataclass
-class ReqMeta:
-    # Request id
-    req_id: str
-    # Request tokens
-    token_ids: torch.Tensor
-    # Slot mapping
-    slot_mapping: torch.Tensor
-    # Skip save or not
-    save_spec: Optional[SaveSpec] = None
-    # load_spec
-    load_spec: Optional[LoadSpec] = None
-
-    @staticmethod
-    def from_request_tracker(
-        tracker: RequestTracker,
-        block_size: int,
-        load_spec: Optional[LoadSpec] = None,
-        skip_save: bool = False,
-        discard_partial_chunks: bool = True,
-    ) -> Optional["ReqMeta"]:
-        """Create the request metadata from a request tracker.
-
-        Args:
-            tracker (RequestTracker): the request tracker.
-            block_size (int): the block size in vLLM.
-            load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
-            skip_save (bool): whether to skip the save operation.
-            discard_partial_chunks (bool): whether to discard partial chunks.
-
-        Returns:
-            the request metadata if we need to perform load/save
-            operations, None otherwise.
-        """
-        input_token_ids = tracker.token_ids
-        input_token_len = len(input_token_ids)
-
-        # For save operation: do not save if the following condition is met
-        # 1. has already been saved before (num_saved_tokens > 0)
-        # 2. number of unsaved tokens is not reached the chunk boundary
-        skip_leading_tokens = tracker.num_saved_tokens
-        chunk_boundary = (
-            cdiv(tracker.num_saved_tokens + 1, block_size) * block_size
-        )
-        skip_save = skip_save or (
-            tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary
-        )
-
-        if skip_save and load_spec is None:
-            return None
-
-        # Calculate number of tokens to save based on discard_partial_chunks
-        # setting
-        num_tokens_to_save = (
-            (input_token_len // block_size * block_size)
-            if discard_partial_chunks
-            else input_token_len
-        )
-
-        # If we need to save, update the number of saved tokens
-        if not skip_save:
-            tracker.num_saved_tokens = num_tokens_to_save
-        save_spec = SaveSpec(skip_leading_tokens, not skip_save)
-
-        # Calculate the token ids and slot mappings for load and save
-        # OPTIMIZATION: pre-allocate the buffer for token ids and block ids
-        token_ids = torch.tensor(input_token_ids)[:num_tokens_to_save]
-        num_blocks = len(tracker.allocated_block_ids)
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
-
-        if len(token_ids) > num_blocks * block_size:
-            logger.error(
-                "The number of tokens is more than the number of blocks."
-                "Something might be wrong in scheduling logic!"
-            )
-            logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
-                len(token_ids),
-                num_blocks,
-                block_size,
-            )
-
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
-        )
-
-        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
-
-        # For load operation: check whether the request is scheduled to load
-        if load_spec is not None and load_spec.can_load:
-            logger.debug(
-                "Scheduled to load %d tokens for request %s",
-                load_spec.mooncake_cached_tokens,
-                tracker.req_id,
-            )
-        else:
-            # Do not load if not in `can_load` state
-            load_spec = None
-
-        return ReqMeta(
-            req_id=tracker.req_id,
-            token_ids=token_ids,
-            slot_mapping=slot_mapping,
-            save_spec=save_spec,
-            load_spec=load_spec,
-        )
-
-
-@dataclass
-class MooncakeConnectorMetadata(KVConnectorMetadata):
-    requests: list[ReqMeta]
-
-    def __init__(self):
-        self.requests = []
-
-    def add_request(self, req_meta: ReqMeta) -> None:
-        """Add a request to the metadata.
-
-        Args:
-            req_meta (ReqMeta): the request metadata.
-        """
-        self.requests.append(req_meta)
 
 
 class MooncakeConnectorV1(KVConnectorBase_V1):
@@ -268,23 +44,16 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         self._block_size = vllm_config.cache_config.block_size
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
-            "skip_last_n_tokens", 0
+            "skip_last_n_tokens", 1
         )
-
-        self.num_layers = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
-        self.current_layer = 0
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakeConnectorV1Scheduler(vllm_config, self.skip_last_n_tokens) 
+            self.connector_scheduler = MooncakeConnectorV1Scheduler(vllm_config, self.skip_last_n_tokens, self.use_layerwise) 
         else:
             self.connector_worker = MoonCakeEngine(
-                vllm_config.model_config,
-                vllm_config.parallel_config,
-                vllm_config.cache_config,
-                vllm_config.scheduler_config,
+                vllm_config,
                 self.use_layerwise,
+                self.skip_last_n_tokens,
             )
 
             assert self.connector_worker is not None
@@ -328,92 +97,38 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
     ) -> KVConnectorMetadata:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
+    
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, block_ids)
+
 
     ############################################################
     # Worker Side Methods
     ############################################################
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        assert self.connector_worker is not None
+        self.connector_worker.register_kv_caches(kv_caches)
+
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs) -> None:
-        self.current_layer = 0
-        if len(self.kv_caches) == 0:
-            self._init_kv_caches_from_forward_context(forward_context)
-
-        assert len(self.kv_caches) > 0
-        kvcaches = list(self.kv_caches.values())
-
         attn_metadata = forward_context.attn_metadata
-
         if attn_metadata is None:
             logger.warning("In connector.start_load_kv, but the attn_metadata is None")
             return
+        assert self.connector_worker is not None
+        assert isinstance(self._get_connector_metadata(), MooncakeConnectorMetadata)
+        self.connector_worker.start_load_kv(self._get_connector_metadata())
         
-        metadata = self._get_connector_metadata()
-        self.layerwise_retrievers = []
-        for request in metadata.requests:
-            if request.load_spec is None:
-                continue
-
-            tokens = request.token_ids
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.npu()
-            assert len(tokens) == len(slot_mapping)
-
-            token_mask = torch.ones_like(tokens, dtype=torch.bool)
-            masked_token_count = (
-                request.load_spec.vllm_cached_tokens
-                // self._block_size
-                * self._block_size
-            )
-            token_mask[:masked_token_count] = False
-
-            if self.skip_last_n_tokens > 0:
-                tokens = tokens[: -self.skip_last_n_tokens]
-                token_mask = token_mask[: -self.skip_last_n_tokens]
-            if self.use_layerwise:
-                layerwise_retriever = self.connector_worker.retrieve_layer(
-                    tokens,
-                    token_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                )
-                next(layerwise_retriever)   # first layer load
-                self.layerwise_retrievers.append(layerwise_retriever)
-            else:
-                ret_token_mask = self.connector_worker.retrieve(
-                    tokens,
-                    token_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                )
-
-                # Check the result
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                num_expected_tokens = (
-                    request.load_spec.mooncake_cached_tokens
-                    - request.load_spec.vllm_cached_tokens
-                    - self.skip_last_n_tokens
-                )
-                if num_retrieved_tokens < num_expected_tokens:
-                    logger.error(
-                        "The number of retrieved tokens is less than the "
-                        "expected number of tokens! This should not happen!"
-                    )
-                    logger.error(
-                        "Num retrieved tokens: %d, num expected tokens: %d",
-                        num_retrieved_tokens,
-                        num_expected_tokens,
-                    )
-
     def wait_for_layer_load(self, layer_name: str) -> None:
         """MooncakeConnector does not do layerwise saving."""
         if not self.use_layerwise:
             return
-        for layerwise_retriever in self.layerwise_retrievers:
-            ret_token_mask = next(layerwise_retriever)
-            if self.current_layer == self.num_layers - 1:
-                assert ret_token_mask is not None
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+        self.connector_worker.wait_for_layer_load()
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
@@ -424,131 +139,25 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
-        
-        connector_metadata = self._get_connector_metadata()
-       
-        assert len(self.kv_caches) > 0
-        kvcaches = list(self.kv_caches.values())
-        if self.current_layer == 0:
-            self.layerwise_storers = []
-            for request in connector_metadata.requests:
-                save_spec = request.save_spec
-                if save_spec is None or not save_spec.can_save:
-                    continue
-
-                token_ids = request.token_ids
-                assert isinstance(token_ids, torch.Tensor)
-                assert token_ids.is_cpu
-
-                slot_mapping = request.slot_mapping
-                assert isinstance(slot_mapping, torch.Tensor)
-                assert len(slot_mapping) == len(token_ids)
-
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.npu()
-                skip_leading_tokens = max(
-                    self.connector_worker.lookup(token_ids, self.use_layerwise),
-                    save_spec.skip_leading_tokens,
-                )
-                if skip_leading_tokens == len(token_ids):
-                    continue  # skip this request
-
-                skip_leading_tokens = (
-                    skip_leading_tokens
-                    // self._block_size
-                    * self._block_size
-                )
-
-                store_mask = torch.ones_like(token_ids, dtype=torch.bool)
-                store_mask[:skip_leading_tokens] = False
-                logger.info(
-                    "Storing KV cache for %d out of %d tokens "
-                    "(skip_leading_tokens=%d) for request %s",
-                    len(token_ids) - skip_leading_tokens,
-                    len(token_ids),
-                    skip_leading_tokens,
-                    request.req_id,
-                )
-
-                layerwise_storer = self.connector_worker.store_layer(
-                    token_ids,
-                    mask=store_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                    offset=skip_leading_tokens,
-                )
-                self.layerwise_storers.append(layerwise_storer)
-        for layerwise_storer in self.layerwise_storers:
-            try:
-                next(layerwise_storer)
-            except Exception as e:
-                raise
-            self.current_layer = self.current_layer + 1
+        self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):
         """MooncakeConnector does not save explicitly."""
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
-        
-        self.save_layer = 0
+
         if self.use_layerwise:
             self.connector_worker.wait_layer_transfer_finish()
             return
         
-        connector_metadata = self._get_connector_metadata()
-       
-        assert len(self.kv_caches) > 0
-        kvcaches = list(self.kv_caches.values())
-        self.layerwise_storers = []
+        self.connector_worker.wait_for_save(self._get_connector_metadata())
 
-        for request in connector_metadata.requests:
-            save_spec = request.save_spec
-            if save_spec is None or not save_spec.can_save:
-                continue
-
-            token_ids = request.token_ids
-            assert isinstance(token_ids, torch.Tensor)
-            assert token_ids.is_cpu  # why is cpu?
-
-            slot_mapping = request.slot_mapping
-            assert isinstance(slot_mapping, torch.Tensor)
-            assert len(slot_mapping) == len(token_ids)
-
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.npu()
-            skip_leading_tokens = max(
-                self.connector_worker.lookup(token_ids, self.use_layerwise),
-                save_spec.skip_leading_tokens,
-            )
-            if skip_leading_tokens == len(token_ids):
-                continue  # skip this request
-
-            skip_leading_tokens = (
-                skip_leading_tokens
-                // self._block_size
-                * self._block_size
-            )
-
-            store_mask = torch.ones_like(token_ids, dtype=torch.bool)
-            store_mask[:skip_leading_tokens] = False
-            
-            logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
-            )
-
-            self.connector_worker.store(
-                token_ids,
-                mask=store_mask,
-                kvcaches=kvcaches,
-                slot_mapping=slot_mapping,
-                offset=skip_leading_tokens,
-            )
+    def get_finished(self,
+                        finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+            """Get the finished recving and sending requests."""
+            assert self.connector_worker is not None
+            return self.connector_worker.get_finished()
 
 def get_zmq_rpc_path_mooncake(
     vllm_config: Optional["VllmConfig"] = None,
@@ -564,10 +173,10 @@ def get_zmq_rpc_path_mooncake(
     return f"ipc://{base_url}/mooncake_rpc_port_{rpc_port}"
 
 
-
 class MooncakeConnectorV1Scheduler:
-    def __init__(self, vllm_config: "VllmConfig", skip_last_n_tokens):
+    def __init__(self, vllm_config: "VllmConfig", skip_last_n_tokens, use_layerwise):
         self.client=MooncakeLookupClient(vllm_config)
+        self.use_layerwise=use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
                 # request_id -> (vllm cached tokes, mooncake cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
@@ -609,10 +218,10 @@ class MooncakeConnectorV1Scheduler:
         else:
             num_external_hit_tokens = self.client.lookup(token_ids)
 
-        # When prompt length is divisible by the block size and all
-        # blocks are cached, we need to recompute the last token.
-        # This will be removed in the future if vLLM's scheduler provides
-        # a better support for this case.
+        When prompt length is divisible by the block size and all
+        blocks are cached, we need to recompute the last token.
+        This will be removed in the future if vLLM's scheduler provides
+        a better support for this case.
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
 
@@ -634,6 +243,7 @@ class MooncakeConnectorV1Scheduler:
             mooncake_cached_tokens=num_external_hit_tokens,
             can_load=False,
         )
+
         return need_to_allocate, False
 
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):
@@ -643,6 +253,7 @@ class MooncakeConnectorV1Scheduler:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
+        self._unfinished_requests[request.request_id] = request
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
             return
@@ -665,7 +276,6 @@ class MooncakeConnectorV1Scheduler:
         )
 
         self.load_specs[request.request_id].can_load = True
-        self._unfinished_requests[request.request_id] = request
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -681,7 +291,7 @@ class MooncakeConnectorV1Scheduler:
         """
 
         force_skip_save = self.kv_role == "kv_consumer"
-
+        
         meta = MooncakeConnectorMetadata()
 
         for finished_req_id in scheduler_output.finished_req_ids:
@@ -768,6 +378,24 @@ class MooncakeConnectorV1Scheduler:
                 if req_meta is not None:
                     meta.add_request(req_meta)
         return meta
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """
+        Once a request is finished, determine whether request blocks
+        should be freed now or will be sent asynchronously and freed later.
+        """
+
+        if self.kv_role == "kv_consumer":
+            return False, None
+        delay_free_blocks = len(block_ids) > 0
+        if delay_free_blocks:
+            logger.info("Delaying free of %d blocks for request %s",
+                        len(block_ids), request.request_id)
+        return delay_free_blocks, None
 
 
 class MooncakeLookupClient:
