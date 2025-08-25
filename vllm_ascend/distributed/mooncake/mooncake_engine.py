@@ -19,16 +19,13 @@ from vllm.config import (
     ParallelConfig,
     SchedulerConfig,
 )
-from vllm_ascend.distributed.mooncake.config_data import MoonCakeEngineKey, MoonCakeEngineMetadata, ChunkedTokenDatabase, LayerMoonCakeEngineKey, MooncakeConnectorMetadata, LasyerMultiBlockReqMeta
-from vllm_ascend.distributed.mooncake.mooncake_store import Mooncakestore
-from vllm_ascend.distributed.mooncake.kv_transfer import KVTransferThread, KVCacheStoreSendingThread, KVCacheStoreRecvingThread, KVCacheStoreLayerSendingThread, KVCacheStoreLayerRecvingThread
+from vllm_ascend.distributed.memcache.config_data import MemcacheEngineKey, MemcacheEngineMetadata, ChunkedTokenDatabase, LayerMemcacheEngineKey, MemcacheConnectorMetadata, LasyerMultiBlockReqMeta
+from vllm_ascend.distributed.memcache.memcache_store import Memcachestore
+from vllm_ascend.distributed.memcache.kv_transfer import KVTransferThread, KVCacheStoreSendingThread, KVCacheStoreRecvingThread, KVCacheStoreLayerSendingThread, KVCacheStoreLayerRecvingThread
 # First Party
 
 
-
-
-
-class MoonCakeEngine:
+class MemcacheEngine:
     #The main class for the cache engine.
 
     def __init__(
@@ -66,7 +63,7 @@ class MoonCakeEngine:
             kv_shape = (self.num_layers, 1, self.block_size, 1, head_size)
         else:
             kv_shape = (self.num_layers, 2, self.block_size, num_kv_head, head_size)
-        self.metadata = MoonCakeEngineMetadata(
+        self.metadata = MemcacheEngineMetadata(
             model_config.model,
             parallel_config.world_size,
             parallel_config.rank,
@@ -78,7 +75,7 @@ class MoonCakeEngine:
 
         self.token_database = ChunkedTokenDatabase(self.metadata)
 
-        self.m_store = Mooncakestore(parallel_config)
+        self.m_store = Memcachestore(parallel_config)
         
         self.kv_send_thread: Optional[KVTransferThread] = None
         self.kv_recv_thread: Optional[KVTransferThread] = None
@@ -156,11 +153,11 @@ class MoonCakeEngine:
             self.kv_recv_thread.start()
             ready_event.wait()
     
-    def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+    def start_load_kv(self, metadata: MemcacheConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers = []
         for request in metadata.requests:
-            if request.load_spec is None:
+            if request.load_spec is None or not request.load_spec.can_load:   #load =0
                 continue
 
             tokens = request.token_ids
@@ -169,8 +166,8 @@ class MoonCakeEngine:
             if self.skip_last_n_tokens > 0:
                 tokens = tokens[: -self.skip_last_n_tokens]
                 token_mask = token_mask[: -self.skip_last_n_tokens]
-            if tokens.shape[0] > request.load_spec.vllm_cached_tokens + request.load_spec.mooncake_cached_tokens:
-                tokens = tokens[: request.load_spec.vllm_cached_tokens + request.load_spec.mooncake_cached_tokens]
+            if tokens.shape[0] > request.load_spec.memcache_cached_tokens:   # test
+                tokens = tokens[: request.load_spec.memcache_cached_tokens]
             masked_token_count = (
                 request.load_spec.vllm_cached_tokens
                 // self.block_size
@@ -196,7 +193,7 @@ class MoonCakeEngine:
                 )
         
     def wait_for_layer_load(self) -> None:
-        """MooncakeConnector does not do layerwise saving."""
+        """MemcacheConnector does not do layerwise saving."""
         for layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
             if self.current_layer == self.num_layers - 1:
@@ -204,8 +201,8 @@ class MoonCakeEngine:
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
     
-    def save_kv_layer(self, connector_metadata: MooncakeConnectorMetadata) -> None:
-        """MooncakeConnector does not save explicitly."""
+    def save_kv_layer(self, connector_metadata: MemcacheConnectorMetadata) -> None:
+        """MemcacheConnector does not save explicitly."""
         if self.current_layer == 0:
             self.layerwise_storers = []
             for request in connector_metadata.requests:
@@ -262,8 +259,8 @@ class MoonCakeEngine:
                 raise
             self.current_layer = self.current_layer + 1
 
-    def wait_for_save(self, connector_metadata: MooncakeConnectorMetadata):
-        """MooncakeConnector does not save explicitly."""
+    def wait_for_save(self, connector_metadata: MemcacheConnectorMetadata):
+        """MemcacheConnector does not save explicitly."""
         for request in connector_metadata.requests:
             save_spec = request.save_spec
             if save_spec is None or not save_spec.can_save:
@@ -362,7 +359,7 @@ class MoonCakeEngine:
             keys = [list(row) for row in zip(*keys, strict=False)]   # [num_layer,block_num]
             for layer_id, keys_multi_chunk in enumerate(keys):
                 if not first_flag:
-                    is_finish=self.get_event.wait(timeout=3)
+                    is_finish=self.get_event.wait(timeout=3)   #try---cache
                     if not is_finish:
                         raise SystemError("Layerwise get failed")
                     self.get_event.clear()
@@ -490,10 +487,11 @@ class MoonCakeEngine:
             try:
                 if use_layerwise:
                     keys_multi_layer = key.split_layers(self.num_layers)
-                    res=self.m_store.exists(keys_multi_layer[-1])
+                    # batch is_exists
+                    res=self.m_store.exists(keys_multi_layer[-1]) and self.m_store.exists(keys_multi_layer[0])
                 else:
                     res=self.m_store.exists(key)
-                if res:
+                if res == 1:
                     continue
                 else:
                     return start
