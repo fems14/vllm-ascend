@@ -1,5 +1,6 @@
 # Standard
 from typing import Dict, Generator, List, Optional, Union
+import math
 import asyncio
 import multiprocessing
 import time
@@ -12,24 +13,19 @@ import torch, torch_npu
 from vllm.utils import cdiv, get_kv_cache_torch_dtype, round_down
 from vllm.utils import logger
 from vllm.config import (
+    VllmConfig,
     CacheConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
 )
-from vllm_ascend.distributed.mooncake.config_data import MoonCakeEngineKey, MoonCakeEngineMetadata, ChunkedTokenDatabase, LayerMoonCakeEngineKey
+from vllm_ascend.distributed.mooncake.config_data import MoonCakeEngineKey, MoonCakeEngineMetadata, ChunkedTokenDatabase, LayerMoonCakeEngineKey, MooncakeConnectorMetadata, LasyerMultiBlockReqMeta
 from vllm_ascend.distributed.mooncake.mooncake_store import Mooncakestore
-from vllm_ascend.distributed.mooncake.mooncake_store_npu import PagedMemNPUConnector, PagedMemNPUConnectorMLA
+from vllm_ascend.distributed.mooncake.kv_transfer import KVTransferThread, KVCacheStoreSendingThread, KVCacheStoreRecvingThread, KVCacheStoreLayerSendingThread, KVCacheStoreLayerRecvingThread
 # First Party
 
 
-@dataclass
-class LasyerBlockReqMeta:
-    key: LayerMoonCakeEngineKey
-    kvcache: List[torch.Tensor]
-    start: int
-    end: int
-    slot_mapping: torch.Tensor
+
 
 
 class MoonCakeEngine:
@@ -37,12 +33,12 @@ class MoonCakeEngine:
 
     def __init__(
         self,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-        cache_config: CacheConfig,
-        scheduler_config: SchedulerConfig,
-        use_layerwize: bool
+        vllm_config: VllmConfig,
+        use_layerwize: bool,
+        skip_last_n_tokens: int,
     ):
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
         self.use_mla = False
         if (
             hasattr(model_config, "use_mla")
@@ -50,135 +46,281 @@ class MoonCakeEngine:
             and model_config.use_mla
         ):
             self.use_mla = True
-        num_layer = model_config.get_num_layers(parallel_config)
-        chunk_size = cache_config.block_size
+        self.use_layerwise=use_layerwize
+        self.skip_last_n_tokens = skip_last_n_tokens
+        self.tp_rank = parallel_config.rank
+        self.tp_size = parallel_config.tensor_parallel_size
+        self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self.engine_id = str(vllm_config.kv_transfer_config.engine_id)
+        self.block_size = vllm_config.cache_config.block_size
+        self.current_layer = 0
+        # self.use_mla = first_kv_cache_tuple[0].size(
+        #     -1) != first_kv_cache_tuple[1].size(-1)
+        self.num_layers = model_config.get_num_layers(parallel_config)
+        self.block_size = vllm_config.cache_config.block_size
         num_kv_head = model_config.get_num_kv_heads(parallel_config)
         head_size = model_config.get_head_size()
-        kv_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype, model_config.dtype)
-        hidden_dim_size = num_kv_head * head_size
+        kv_dtype = get_kv_cache_torch_dtype(vllm_config.cache_config.cache_dtype, model_config.dtype)
+        self.hidden_dim_size = num_kv_head * head_size
         if self.use_mla:
-            kv_shape = (num_layer, 1, chunk_size, 1, head_size)
+            kv_shape = (self.num_layers, 1, self.block_size, 1, head_size)
         else:
-            kv_shape = (num_layer, 2, chunk_size, num_kv_head, head_size)
+            kv_shape = (self.num_layers, 2, self.block_size, num_kv_head, head_size)
         self.metadata = MoonCakeEngineMetadata(
             model_config.model,
             parallel_config.world_size,
             parallel_config.rank,
             kv_dtype,
             kv_shape,
-            chunk_size,
+            self.block_size,
             self.use_mla,
         )
 
         self.token_database = ChunkedTokenDatabase(self.metadata)
 
         self.m_store = Mooncakestore(parallel_config)
+        
+        self.kv_send_thread: Optional[KVTransferThread] = None
+        self.kv_recv_thread: Optional[KVTransferThread] = None
 
+      
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        _, first_kv_cache_tuple = next(iter(kv_caches.items()))
+        first_kv_cache = first_kv_cache_tuple[0]
+
+        # TODO(tms): Find a more robust way to detect and handle MLA
         if self.use_mla:
-            self.npu_transfer=PagedMemNPUConnectorMLA(hidden_dim_size, num_layer, self.m_store)
+            # MLA case.[num_block, block_size, 1, hidden_dim]
+            self.num_blocks = first_kv_cache.shape[0]
+            block_rank = 3  # [block_size, latent_dim]
+            block_shape_norm = first_kv_cache_tuple[0].shape[-block_rank:]
+            block_shape_pe = first_kv_cache_tuple[1].shape[-block_rank:]
+            self.block_len = [
+                first_kv_cache[0].element_size() * math.prod(block_shape_norm),
+                first_kv_cache[1].element_size() * math.prod(block_shape_pe)
+            ]
+            logger.info(
+                "num_blocks: %s, block_shape_norm: %s, block_shape_pe: %s",
+                self.num_blocks, block_shape_norm, block_shape_pe)
         else:
-            self.npu_transfer=PagedMemNPUConnector(hidden_dim_size, num_layer, self.m_store)
+            # [num_block, block_size, num_head, hidden_dim]
+            self.num_blocks = first_kv_cache.shape[0]
+            kv_elem_size = first_kv_cache.element_size()
+            block_rank = 3  # [block_size, kv_heads, head_dim]
+            block_shape = first_kv_cache.shape[-block_rank:]
+            self.block_len = [kv_elem_size * math.prod(block_shape)]
+            logger.info("num_blocks: %s, block_shape: %s", self.num_blocks,
+                        block_shape)
 
-        if use_layerwize:
-            self.load_stream = torch.npu.Stream()
-            self.save_stream = torch.npu.Stream()
-            self.save_input_queue: queue.Queue[list[LasyerBlockReqMeta]] = queue.Queue()
-            self.save_thread = threading.Thread(target=self._save_listener)
-            self.save_thread.start()
-            self.num_layers = num_layer
+        logger.info("Registering KV_Caches. use_mla: %s, shape %s",
+                    self.use_mla, first_kv_cache.shape)
 
-    @torch.inference_mode()
-    def store(
-        self,
-        tokens: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> None:
-        """Store the tokens and mask into the cache engine.
-
-        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
-
-        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
-            have the same length as tokens. And the mask should ALWAYS be like
-            FFFFFTTTTTTT, where True means the tokens needs to be matched,
-            and the Falses will ALWAYS be at the PREFIX of the tensor.
-
-        :param **kwargs: The additional arguments for the KV transfer which
-            will be passed into the npu_transfer.
-            Should include KV cache specific information (e.g., paged KV buffer
-            and the page tables).
-
-        :raises: ValueError if the number of Falses in the mask is not a
-            multiple of the chunk size.
-        """
-
-        if mask is not None:
-            num_stored_tokens = torch.sum(mask).item()
+        self.kv_caches = kv_caches
+        self.kv_caches_base_addr = []
+        for cache_or_caches in kv_caches.values():
+            # Normalize to always be a list of caches
+            if self.use_mla:
+                for i, cache in enumerate(cache_or_caches, 0):
+                    base_addr = cache.data_ptr()
+                    self.kv_caches_base_addr.append(base_addr)
+            else:
+                cache_list = [cache_or_caches
+                              ] if self.use_mla else cache_or_caches
+                for cache in cache_list:
+                    base_addr = cache.data_ptr()
+                    self.kv_caches_base_addr.append(base_addr)
+        
+        if self.use_layerwise:
+            self.get_event = threading.Event()
+            if self.kv_role == 'kv_producer':
+                ready_event_sending = threading.Event()
+                self.kv_send_thread = KVCacheStoreLayerSendingThread(self.tp_rank, self.tp_size, self.m_store, self.engine_id,
+                    self.kv_caches_base_addr, self.token_database, self.block_len, self.block_size, ready_event_sending, self.num_layers)
+                self.kv_send_thread.start()
+            ready_event = threading.Event()
+            self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
+                self.tp_rank, self.tp_size, self.m_store, self.engine_id,
+                self.kv_caches_base_addr, self.token_database, self.block_len,  self.block_size, ready_event, self.get_event)
+            self.kv_recv_thread.start()
+            ready_event.wait()
         else:
-            num_stored_tokens = len(tokens)
-
-        for start, end, key in self.token_database.process_tokens(tokens, mask):
-            if self.m_store.exists(key):
-                continue
-            num_tokens = end - start
-            kv_shape = self.npu_transfer.get_shape(num_tokens)
-            kv_dtype = self.metadata.kv_dtype
-            tensor = torch.empty(kv_shape, dtype=kv_dtype) 
-            self.npu_transfer.npu_d2h(tensor, start, end, **kwargs)
-            self.m_store.put(key, tensor, kv_shape, kv_dtype, self.use_mla)
-        logger.debug(f"Stored {num_stored_tokens} out of total {len(tokens)} tokens")
-
-    @torch.inference_mode()
-    def retrieve(
-        self,
-        tokens: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Retrieve the KV caches from the cache engine.
-
-        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
-
-        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
-            have the same length as tokens. And the mask should ALWAYS be like
-            FFFFFTTTTTTT, where True means the tokens needs to be matched,
-            and the Falses will ALWAYS be at the PREFIX of the tensor.
-
-        :param **kwargs: The additional arguments for the KV transfer which
-            will be passed into the npu_transfer.
-            Should include KV cache specific information (e.g., paged KV buffer
-            and the page tables).
-
-        :return: the boolean mask indicating which tokens are retrieved. The
-            length of the mask should be the same as the tokens. 
-
-        :raises: ValueError if the number of Falses in the mask is not a
-            multiple of the chunk size.
-        """
-        if mask is not None:
-            num_required_tokens = torch.sum(mask).item()
-        else:
-            num_required_tokens = len(tokens)
-
-        ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
-        for start, end, key in self.token_database.process_tokens(tokens, mask):
-            memory_tensor = self.m_store.get(key, self.use_mla)    
-            ret_mask[start:end] = True
-            self.npu_transfer.npu_h2d(memory_tensor, start, end, **kwargs)
-
-        retrieved_tokens = torch.sum(ret_mask)
-        logger.debug(
-            f"Retrieved {retrieved_tokens} "
-            f"out of {num_required_tokens} "
-            f"out of total {len(tokens)} tokens"
-        )
-        return ret_mask
+            if self.kv_role == 'kv_producer':
+                ready_event_sending = threading.Event()
+                self.kv_send_thread = KVCacheStoreSendingThread(self.tp_rank, self.tp_size, self.m_store, self.engine_id,
+                    self.kv_caches_base_addr, self.token_database, self.block_len, self.block_size, ready_event_sending)
+                self.kv_send_thread.start()
+            ready_event = threading.Event()
+            self.kv_recv_thread = KVCacheStoreRecvingThread(
+                self.tp_rank, self.tp_size, self.m_store, self.engine_id,
+                self.kv_caches_base_addr, self.token_database, self.block_len, self.block_size, ready_event)
+            self.kv_recv_thread.start()
+            ready_event.wait()
     
+    def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        self.current_layer = 0
+        self.layerwise_retrievers = []
+        for request in metadata.requests:
+            if request.load_spec is None:
+                continue
+
+            tokens = request.token_ids
+            token_mask = torch.ones_like(tokens, dtype=torch.bool)
+            req_id = request.req_id
+            if self.skip_last_n_tokens > 0:
+                tokens = tokens[: -self.skip_last_n_tokens]
+                token_mask = token_mask[: -self.skip_last_n_tokens]
+            if tokens.shape[0] > request.load_spec.vllm_cached_tokens + request.load_spec.mooncake_cached_tokens:
+                tokens = tokens[: request.load_spec.vllm_cached_tokens + request.load_spec.mooncake_cached_tokens]
+            masked_token_count = (
+                request.load_spec.vllm_cached_tokens
+                // self.block_size
+                * self.block_size
+            )
+            token_mask[:masked_token_count] = False
+
+            if self.use_layerwise:
+                layerwise_retriever = self.retrieve_layer(
+                    req_id,
+                    tokens,
+                    request.slot_mapping,
+                    token_mask,
+                )
+                next(layerwise_retriever)   # first layer load
+                self.layerwise_retrievers.append(layerwise_retriever)
+            else:
+                self.kv_recv_thread.add_request(
+                    req_id,
+                    tokens,
+                    request.slot_mapping,
+                    token_mask,
+                )
+        
+    def wait_for_layer_load(self) -> None:
+        """MooncakeConnector does not do layerwise saving."""
+        for layerwise_retriever in self.layerwise_retrievers:
+            ret_token_mask = next(layerwise_retriever)
+            if self.current_layer == self.num_layers - 1:
+                assert ret_token_mask is not None
+                num_retrieved_tokens = ret_token_mask.sum().item()
+                logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+    
+    def save_kv_layer(self, connector_metadata: MooncakeConnectorMetadata) -> None:
+        """MooncakeConnector does not save explicitly."""
+        if self.current_layer == 0:
+            self.layerwise_storers = []
+            for request in connector_metadata.requests:
+                save_spec = request.save_spec
+                if save_spec is None or not save_spec.can_save:
+                    continue
+
+                token_ids = request.token_ids
+                token_ids = token_ids[: -self.skip_last_n_tokens]
+                req_id = request.req_id
+                assert isinstance(token_ids, torch.Tensor)
+                assert token_ids.is_cpu
+
+                slot_mapping = request.slot_mapping
+                assert isinstance(slot_mapping, torch.Tensor)
+
+                # TODO: whther need to remov saveThread
+                # no lookup, skipmask
+                skip_leading_tokens = max(
+                    self.lookup(token_ids, self.use_layerwise),
+                    save_spec.skip_leading_tokens,
+                )
+                if skip_leading_tokens == len(token_ids):
+                    continue  # skip this request
+
+                skip_leading_tokens = (
+                    skip_leading_tokens
+                    // self.block_size
+                    * self.block_size
+                )
+
+                store_mask = torch.ones_like(token_ids, dtype=torch.bool)
+                store_mask[:skip_leading_tokens] = False
+                logger.info(
+                    "Storing KV cache for %d out of %d tokens "
+                    "(skip_leading_tokens=%d) for request %s",
+                    len(token_ids) - skip_leading_tokens,
+                    len(token_ids),
+                    skip_leading_tokens,
+                    request.req_id,
+                )
+
+                layerwise_storer = self.store_layer(
+                    req_id,
+                    token_ids,
+                    mask=store_mask,
+                    slot_mapping=slot_mapping,
+                )
+                self.layerwise_storers.append(layerwise_storer)
+        for layerwise_storer in self.layerwise_storers:
+            try:
+                next(layerwise_storer)
+            except Exception as e:
+                raise
+            self.current_layer = self.current_layer + 1
+
+    def wait_for_save(self, connector_metadata: MooncakeConnectorMetadata):
+        """MooncakeConnector does not save explicitly."""
+        for request in connector_metadata.requests:
+            save_spec = request.save_spec
+            if save_spec is None or not save_spec.can_save:
+                continue
+
+            token_ids = request.token_ids
+            token_ids = token_ids[: -self.skip_last_n_tokens]
+            req_id = request.req_id
+            assert isinstance(token_ids, torch.Tensor)
+            assert token_ids.is_cpu  # why is cpu?
+
+            slot_mapping = request.slot_mapping
+            assert isinstance(slot_mapping, torch.Tensor)
+
+            # TODO: have a pre-allocated buffer to hold the slot_mappings
+            # slot_mapping = slot_mapping.npu()
+
+            # TODO: whther need to remov saveThread
+            # no lookup, skip mask
+            skip_leading_tokens = max(
+                self.lookup(token_ids, self.use_layerwise),
+                save_spec.skip_leading_tokens,
+            )
+            if skip_leading_tokens == len(token_ids):
+                continue  # skip this request
+
+            skip_leading_tokens = (
+                skip_leading_tokens
+                // self.block_size
+                * self.block_size
+            )
+
+            store_mask = torch.ones_like(token_ids, dtype=torch.bool)
+            store_mask[:skip_leading_tokens] = False
+            
+            logger.info(
+                "Storing KV cache for %d out of %d tokens "
+                "(skip_leading_tokens=%d) for request %s",
+                len(token_ids) - skip_leading_tokens,
+                len(token_ids),
+                skip_leading_tokens,
+                request.req_id,
+            )
+            
+            self.kv_send_thread.add_request(
+                    req_id,
+                    token_ids,
+                    request.slot_mapping,
+                    store_mask,
+                )
+
     def retrieve_layer(
         self,
+        req_id: str,
         tokens: torch.Tensor,
+        slot_mapping: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        **kwargs,
     ) -> Generator[Optional[torch.Tensor], None, None]:
         """
         Retrieve the KV cache in a layerwise manner.
@@ -207,25 +349,34 @@ class MoonCakeEngine:
         starts = []
         ends = []
         keys = []
+        first_flag= True
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             keys_multi_layer = key.split_layers(self.num_layers)
-
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
-
             ret_mask[start:end] = True
 
         if keys:
             # Transpose the keys into layer major format
-            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]   # [num_layer,block_num]
-
-            get_generator = self.layerwise_batched_get(keys_layer_major, starts, ends,**kwargs) # load layerwise kv generator
-            
-            for layer_id in range(self.num_layers):
-                next(get_generator)
+            keys = [list(row) for row in zip(*keys, strict=False)]   # [num_layer,block_num]
+            for layer_id, keys_multi_chunk in enumerate(keys):
+                if not first_flag:
+                    is_finish=self.get_event.wait(timeout=3)
+                    if not is_finish:
+                        raise SystemError("Layerwise get failed")
+                    self.get_event.clear()
+                req_meta=LasyerMultiBlockReqMeta(
+                        req_id,
+                        keys_multi_chunk,
+                        starts,
+                        ends,
+                        slot_mapping,
+                        layer_id
+                    )
+                self.kv_recv_thread.add_request(req_meta)
+                first_flag=False
                 yield None
-
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -241,27 +392,12 @@ class MoonCakeEngine:
 
         yield ret_mask
 
-    def layerwise_batched_get(
-        self,
-        keys: List[List[LayerMoonCakeEngineKey]],
-        starts: List[int], 
-        ends: List[int],
-        **kwargs,
-    ) -> Generator[None, None, None]:
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
-        self.load_stream.synchronize()
-        for i,keys_multi_chunk in enumerate(keys):
-            for index, key in enumerate(keys_multi_chunk):
-                with torch.npu.stream(self.load_stream):
-                    memory_tensor = self.m_store.get(key, self.use_mla)
-                    self.npu_transfer.npu_h2d_layer(memory_tensor, starts[index], ends[index], kvcaches[i], **kwargs)
-            yield 
-
     def store_layer(
         self,
+        req_id: str,
         tokens: torch.Tensor,
+        slot_mapping: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        **kwargs,
     ) -> Generator[None, None, None]:
         """
         Store the KV cache in a layerwise manner.
@@ -296,62 +432,45 @@ class MoonCakeEngine:
             keys_multi_layer = key.split_layers(self.num_layers)
             starts.append(start)
             ends.append(end)
-            keys.append(keys_multi_layer)
+            keys.append(keys_multi_layer)   #[block_num,layer_num]
         
         if keys:
-            keys = [list(row) for row in zip(*keys, strict=False)]
-            save_generator = self.layerwise_batched_save(keys, starts, ends, **kwargs)
-            for layer_id in range(self.num_layers):   
-                try:
-                    next(save_generator)
-                except StopIteration:
-                    raise 
+            keys = [list(row) for row in zip(*keys, strict=False)]  #[layer_num,block_num]
+            for layer_id, keys_multi_chunk in enumerate(keys):
+                req_meta=LasyerMultiBlockReqMeta(
+                        req_id,
+                        keys_multi_chunk,
+                        starts,
+                        ends,
+                        slot_mapping,
+                        layer_id
+                    )
+                self.kv_send_thread.add_request(req_meta)
                 yield
         else:
             for layer_id in range(self.num_layers):
                 yield
         logger.debug(f"Stored {num_stored_tokens} out of total {len(tokens)} tokens")
 
-    def layerwise_batched_save(
-        self,
-        keys: List[List[LayerMoonCakeEngineKey]],
-        starts: List[int], 
-        ends: List[int],
-        **kwargs,
-    ) -> Generator[None, None, None]:
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        for i,keys_multi_chunk in enumerate(keys):
-            req_meta_list:list[LasyerBlockReqMeta]=[]
-            for index, key in enumerate(keys_multi_chunk):
-                req_meta=LasyerBlockReqMeta(
-                    key,
-                    kvcaches[i],
-                    starts[index],
-                    ends[index],
-                    slot_mapping
-                )
-                req_meta_list.append(req_meta)
-            self.save_input_queue.put(req_meta_list)
-            yield 
-
-    def _save_listener(self):
-        kv_dtype = self.metadata.kv_dtype
-        while True:
-            req_meta_list = self.save_input_queue.get()
-            for req_meta in req_meta_list:
-                torch.npu.current_stream().synchronize()
-                num_tokens=req_meta.end-req_meta.start
-                kv_shape = self.npu_transfer.get_layer_shape(num_tokens)
-                tensor = torch.empty(kv_shape, dtype=kv_dtype) 
-                with torch.npu.stream(self.save_stream):
-                    self.npu_transfer.npu_d2h_layer(tensor, req_meta.start, req_meta.end, kvcaches=req_meta.kvcache, slot_mapping=req_meta.slot_mapping)
-                    self.m_store.put(req_meta.key, tensor, kv_shape, kv_dtype, self.use_mla)
-
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        done_sending = (
+            self.kv_send_thread.
+            get_and_clear_finished_requests(  # type: ignore[union-attr]
+            ) if self.kv_role == 'kv_producer' else set())
+        done_recving = self.kv_recv_thread.get_and_clear_finished_requests()  # type: ignore[union-attr]
+            
+        if self.tp_rank == 0:
+            logger.debug(
+                "Number of completed KV cache send requests: %d, receive "
+                "requests: %d", len(done_sending), len(done_recving))
+        return done_sending, done_recving
+            
     def wait_layer_transfer_finish(self):
-        while not self.save_input_queue.empty():
-            time.sleep(0.0000001)
-        self.save_stream.synchronize()
+        time.sleep(1)
+        pass
+        # while not self.save_input_queue.empty():
+        #     time.sleep(0.0000001)
+        # self.save_stream.synchronize()
 
     def lookup(
         self,
