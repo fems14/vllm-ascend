@@ -23,15 +23,15 @@ from vllm.utils import logger
 from vllm.utils import make_zmq_path, make_zmq_socket, round_down, get_ip,cdiv
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm_ascend.distributed.mooncake.mooncake_engine import MoonCakeEngine
+from vllm_ascend.distributed.memcache.memcache_engine import MemcacheEngine
 from vllm.v1.request import Request
 from vllm.forward_context import ForwardContext
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm_ascend.distributed.mooncake.config_data import MooncakeConnectorMetadata,RequestTracker,LoadSpec,ReqMeta
+from vllm_ascend.distributed.memcache.config_data import MemcacheConnectorMetadata,RequestTracker,LoadSpec,ReqMeta
 
 
 
-class MooncakeConnectorV1(KVConnectorBase_V1):
+class MemcacheConnectorV1(KVConnectorBase_V1):
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
@@ -48,9 +48,9 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         )
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakeConnectorV1Scheduler(vllm_config, self.skip_last_n_tokens, self.use_layerwise) 
+            self.connector_scheduler = MemcacheConnectorV1Scheduler(vllm_config, self.skip_last_n_tokens, self.use_layerwise) 
         else:
-            self.connector_worker = MoonCakeEngine(
+            self.connector_worker = MemcacheEngine(
                 vllm_config,
                 self.use_layerwise,
                 self.skip_last_n_tokens,
@@ -58,21 +58,9 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
 
             assert self.connector_worker is not None
             if vllm_config.parallel_config.rank == 0:
-                self.lookup_server = MooncakeLookupServer(
+                self.lookup_server = MemcacheLookupServer(
                     self.connector_worker, vllm_config, self.use_layerwise
                 )
-    
-    def _init_kv_caches_from_forward_context(self, forward_context: "ForwardContext"):
-        for layer_name in forward_context.no_compile_layers:
-            attn_layer = forward_context.no_compile_layers[layer_name]
-            if not hasattr(attn_layer, "kv_cache"):
-                logger.debug("The layer %s does not have kv_cache, skip it", layer_name)
-                continue
-
-            if layer_name not in self.kv_caches:
-                self.kv_caches[layer_name] = attn_layer.kv_cache[
-                    forward_context.virtual_engine
-                ]
     ############################################################
     # Scheduler Side Methods
     ############################################################
@@ -121,18 +109,18 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
             logger.warning("In connector.start_load_kv, but the attn_metadata is None")
             return
         assert self.connector_worker is not None
-        assert isinstance(self._get_connector_metadata(), MooncakeConnectorMetadata)
+        assert isinstance(self._get_connector_metadata(), MemcacheConnectorMetadata)
         self.connector_worker.start_load_kv(self._get_connector_metadata())
         
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """MooncakeConnector does not do layerwise saving."""
+        """MemcacheConnector does not do layerwise saving."""
         if not self.use_layerwise:
             return
         self.connector_worker.wait_for_layer_load()
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
-        """MooncakeConnector does not save explicitly."""
+        """MemcacheConnector does not save explicitly."""
         if not self.use_layerwise:
             return
         
@@ -142,7 +130,7 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):
-        """MooncakeConnector does not save explicitly."""
+        """MemcacheConnector does not save explicitly."""
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
@@ -159,7 +147,8 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
             assert self.connector_worker is not None
             return self.connector_worker.get_finished()
 
-def get_zmq_rpc_path_mooncake(
+
+def get_zmq_rpc_path_memcache(
     vllm_config: Optional["VllmConfig"] = None,
 ) -> str:
     base_url = envs.VLLM_RPC_BASE_PATH
@@ -167,18 +156,18 @@ def get_zmq_rpc_path_mooncake(
     rpc_port = 0
     if vllm_config is not None:
         rpc_port = vllm_config.kv_transfer_config.get_from_extra_config(
-            "mooncake_rpc_port", 0
+            "memcache_rpc_port", 0
         )
     logger.debug("Base URL: %s, RPC Port: %s", base_url, rpc_port)
-    return f"ipc://{base_url}/mooncake_rpc_port_{rpc_port}"
+    return f"ipc://{base_url}/memcache_rpc_port_{rpc_port}"
 
 
-class MooncakeConnectorV1Scheduler:
+class MemcacheConnectorV1Scheduler:
     def __init__(self, vllm_config: "VllmConfig", skip_last_n_tokens, use_layerwise):
-        self.client=MooncakeLookupClient(vllm_config)
+        self.client=MemcacheLookupClient(vllm_config)
         self.use_layerwise=use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-                # request_id -> (vllm cached tokes, mooncake cached tokens)
+                # request_id -> (vllm cached tokes, memcache cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
         self.skip_last_n_tokens = skip_last_n_tokens
         self._block_size = vllm_config.cache_config.block_size
@@ -228,7 +217,7 @@ class MooncakeConnectorV1Scheduler:
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
         logger.info(
-            "Reqid: %s, Total tokens %d, mooncake hit tokens: %d, need to load: %d",
+            "Reqid: %s, Total tokens %d, memcache hit tokens: %d, need to load: %d",
             request.request_id,
             request.num_tokens,
             num_external_hit_tokens,
@@ -240,11 +229,11 @@ class MooncakeConnectorV1Scheduler:
         
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
-            mooncake_cached_tokens=num_external_hit_tokens,
+            memcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
         )
 
-        return need_to_allocate, False
+        return need_to_allocate, not self.use_layerwise
 
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):
         """
@@ -266,11 +255,11 @@ class MooncakeConnectorV1Scheduler:
         assert (
             num_external_tokens > 0
             and num_external_tokens
-            == self.load_specs[request.request_id].mooncake_cached_tokens
+            == self.load_specs[request.request_id].memcache_cached_tokens
             - self.load_specs[request.request_id].vllm_cached_tokens
         ), (
             f"Mismatch in number of tokens: {num_external_tokens} vs "
-            f"{self.load_specs[request.request_id].mooncake_cached_tokens} - "
+            f"{self.load_specs[request.request_id].memcache_cached_tokens} - "
             f"{self.load_specs[request.request_id].vllm_cached_tokens}"
             f" for request {request.request_id}"
         )
@@ -292,9 +281,10 @@ class MooncakeConnectorV1Scheduler:
 
         force_skip_save = self.kv_role == "kv_consumer"
         
-        meta = MooncakeConnectorMetadata()
+        meta = MemcacheConnectorMetadata()
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            # 是否需要延迟释放？
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
 
@@ -398,11 +388,11 @@ class MooncakeConnectorV1Scheduler:
         return delay_free_blocks, None
 
 
-class MooncakeLookupClient:
+class MemcacheLookupClient:
     def __init__(self, vllm_config: "VllmConfig"):
         self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_mooncake(vllm_config)
+        socket_path = get_zmq_rpc_path_memcache(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
@@ -421,16 +411,16 @@ class MooncakeLookupClient:
         self.socket.close(linger=0)
 
 
-class MooncakeLookupServer:
+class MemcacheLookupServer:
     def __init__(
         self,
-        mooncake_engine: MoonCakeEngine,
+        memcache_engine: MemcacheEngine,
         vllm_config: "VllmConfig",
         use_layerwise: bool,
     ):
         self.decoder = MsgpackDecoder(torch.Tensor)
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_mooncake(vllm_config)
+        socket_path = get_zmq_rpc_path_memcache(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
@@ -438,14 +428,14 @@ class MooncakeLookupServer:
             bind=True,
         )
 
-        self.mooncake_engine = mooncake_engine
+        self.memcache_engine = memcache_engine
         self.running = True
 
         def process_request():
             while self.running:
                 frames = self.socket.recv_multipart(copy=False)
                 token_ids = self.decoder.decode(frames)
-                result = self.mooncake_engine.lookup(token_ids, use_layerwise)
+                result = self.memcache_engine.lookup(token_ids, use_layerwise)
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
 
