@@ -43,17 +43,14 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
 
         self._block_size = vllm_config.cache_config.block_size
 
-        self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
-            "skip_last_n_tokens", 1
-        )
+        self.sended_but_unfinished_reqs: set[str]=set()
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakeStoreConnectorV1Scheduler(vllm_config, self.skip_last_n_tokens, self.use_layerwise) 
+            self.connector_scheduler = MooncakeStoreConnectorV1Scheduler(vllm_config, self.use_layerwise) 
         else:
             self.connector_worker = MooncakeEngine(
                 vllm_config,
                 self.use_layerwise,
-                self.skip_last_n_tokens,
             )
 
             assert self.connector_worker is not None
@@ -144,10 +141,23 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
 
     def get_finished(self,
                         finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-            """Get the finished recving and sending requests."""
-            assert self.connector_worker is not None
-            return self.connector_worker.get_finished()
+        """Get the finished recving and sending requests."""
+        assert self.connector_worker is not None
+        meta = self._get_connector_metadata()
+        done_sending, done_recving = self.connector_worker.get_finished()
+        sended_and_finished:set[str] = set()
+        for item in list(self.sended_but_unfinished_reqs):
+            if item not in meta.unfinished_request_ids:
+                sended_and_finished.add(item)
+                self.sended_but_unfinished_reqs.remove(item)
+        for item in done_sending:
+            if item in meta.unfinished_request_ids:
+                self.sended_but_unfinished_reqs.add(item)
+            else:
+                sended_and_finished.add(item)
 
+
+        return sended_and_finished, done_recving
 
 def get_zmq_rpc_path_mooncake(
     vllm_config: Optional["VllmConfig"] = None,
@@ -164,23 +174,23 @@ def get_zmq_rpc_path_mooncake(
 
 
 class MooncakeStoreConnectorV1Scheduler:
-    def __init__(self, vllm_config: "VllmConfig", skip_last_n_tokens, use_layerwise):
+    def __init__(self, vllm_config: "VllmConfig", use_layerwise):
         self.client=MooncakeLookupClient(vllm_config)
         self.use_layerwise=use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
                 # request_id -> (vllm cached tokes, mooncake cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
-        self.skip_last_n_tokens = skip_last_n_tokens
         self._block_size = vllm_config.cache_config.block_size
                 # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
                 # Whether to discard partial chunks
         self._discard_partial_chunks = (
             vllm_config.kv_transfer_config.get_from_extra_config(
-                "discard_partial_chunks", False
+                "discard_partial_chunks", True
             )
         )
-        self._unfinished_requests: dict[str, Request] = {}
+        self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
+        self._unfinished_request_ids: set[str]=set()
     
     def get_num_new_matched_tokens(
         self,
@@ -245,6 +255,7 @@ class MooncakeStoreConnectorV1Scheduler:
 
         self._unfinished_requests[request.request_id] = (
                         request, local_block_ids)
+        self._unfinished_request_ids.add(request.request_id)
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
             return
@@ -282,13 +293,14 @@ class MooncakeStoreConnectorV1Scheduler:
         """
 
         force_skip_save = self.kv_role == "kv_consumer"
-        
-        meta = MooncakeConnectorMetadata()
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
-        
+            self._unfinished_request_ids.remove(finished_req_id)
+
+        meta = MemcacheConnectorMetadata(self._unfinished_request_ids)
+
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
             load_spec = self.load_specs.pop(request.req_id, None)
@@ -300,35 +312,43 @@ class MooncakeStoreConnectorV1Scheduler:
                 request, num_tokens_to_compute
             )
             self._request_trackers[request.req_id] = request_tracker
-
+            last_chunk_tokens_num = (
+                    (len(request.prompt_token_ids) // self._block_size * self._block_size)
+                    if self._discard_partial_chunks
+                    else len(request.prompt_token_ids)
+                )
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
                 load_spec=load_spec,
                 skip_save=force_skip_save,
-                is_last_chunk=len(request_tracker.token_ids)>=len(request.prompt_token_ids),
+                is_last_chunk=len(request_tracker.token_ids)>=last_chunk_tokens_num,
                 discard_partial_chunks=self._discard_partial_chunks,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        if isinstance(cached_reqs, list):
+        if isinstance(cached_reqs, list) and not force_skip_save:
             for i, req in enumerate(cached_reqs):
                 request_tracker = self._request_trackers[req.req_id]
                 request_tracker.update(req.new_token_ids, req.new_block_ids)
-
+                last_chunk_tokens_num = (
+                    (len(req.prompt_token_ids) // self._block_size * self._block_size)
+                    if self._discard_partial_chunks
+                    else len(req.prompt_token_ids)
+                )
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
                     load_spec=None,
                     skip_save=force_skip_save,
-                    is_last_chunk=len(request_tracker.token_ids)>=len(req.prompt_token_ids),
+                    is_last_chunk=len(request_tracker.token_ids)>=last_chunk_tokens_num,
                     discard_partial_chunks=self._discard_partial_chunks,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
-        else:
+        elif not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 request_tracker = self._request_trackers[req_id]
                 num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
@@ -348,12 +368,21 @@ class MooncakeStoreConnectorV1Scheduler:
                 if not new_block_ids:
                     continue
                 request_tracker.update(new_token_ids, new_block_ids)
+                # decode not save
+                if len(request_tracker.token_ids) > len(request.prompt_token_ids):
+                    continue
+
+                last_chunk_tokens_num = (
+                    (len(request.prompt_token_ids) // self._block_size * self._block_size)
+                    if self._discard_partial_chunks
+                    else len(request.prompt_token_ids)
+                )
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
                     load_spec=None,
                     skip_save=force_skip_save,
-                    is_last_chunk=len(request_tracker.token_ids)>=len(request.prompt_token_ids),
+                    is_last_chunk=len(request_tracker.token_ids)>=last_chunk_tokens_num,
                     discard_partial_chunks=self._discard_partial_chunks,
                 )
                 if req_meta is not None:
@@ -399,6 +428,8 @@ class MooncakeStoreConnectorV1Scheduler:
         """
 
         if self.kv_role == "kv_consumer":
+            return False, None
+        if self._request_trackers[request.request_id].num_saved_tokens <= 0:
             return False, None
         delay_free_blocks = len(block_ids) > 0
         if delay_free_blocks:
