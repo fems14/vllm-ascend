@@ -40,6 +40,7 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
 
+
 def wait_for_kv_layer_from_connector(layer_name: str):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
