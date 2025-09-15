@@ -80,6 +80,7 @@ class Mooncakestore():
         return self.store.batch_is_exist(keys)
 
     def get(self, key: MooncakeEngineKey, addr: list[int], size: list[int]):
+        expect_res = sum(size)
         key_str = key.to_string()
         try:
             res = self.store.batch_get_into_ascend(key_str, addr, size)
