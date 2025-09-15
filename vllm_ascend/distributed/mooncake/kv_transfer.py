@@ -127,6 +127,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         mask=req_meta["mask"]
         block_ids=req_meta["block_ids"]
         req_id=req_meta["req_id"]
+        is_last_chunk = req_meta["is_last_chunk"]
         torch.npu.current_stream().synchronize()
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             addr, size, _ =self.prepare_value(start, end, block_ids)      
