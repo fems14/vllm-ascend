@@ -17,8 +17,6 @@ from vllm_ascend.distributed.mooncake.kv_transfer import (
     KVCacheStoreRecvingThread, KVCacheStoreSendingThread, KVTransferThread)
 from vllm_ascend.distributed.mooncake.mooncake_store import Mooncakestore
 
-# First Party
-
 
 class MooncakeEngine:
     #The main class for the cache engine.
