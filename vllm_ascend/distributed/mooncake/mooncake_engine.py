@@ -184,7 +184,6 @@ class MooncakeEngine:
                     tokens,
                     request.block_ids,
                     token_mask,
-                    request.is_last_chunk,
                 )
 
     def wait_for_layer_load(self) -> None:
