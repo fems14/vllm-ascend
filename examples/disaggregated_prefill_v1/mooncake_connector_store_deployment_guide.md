@@ -87,8 +87,6 @@ python3 -m vllm.entrypoints.openai.api_server \
 			{
 				"kv_connector": "MooncakeConnectorV1",
 				"kv_role": "kv_producer",
-				"kv_buffer_device": "npu",
-				"kv_rank": 0,
 				"kv_port": "20001",
 				"kv_connector_extra_config": {
 					"prefill": {
@@ -104,8 +102,6 @@ python3 -m vllm.entrypoints.openai.api_server \
             		{
 				"kv_connector": "MooncakeConnectorStoreV1",
 				"kv_role": "kv_producer",
-				"kv_buffer_device": "npu",
-				"kv_rank": 0
 			}  
 		]
 	}
@@ -152,8 +148,6 @@ python3 -m vllm.entrypoints.openai.api_server \
 		{
 				"kv_connector": "MooncakeConnectorV1",
 				"kv_role": "kv_consumer",
-				"kv_buffer_device": "npu",
-				"kv_rank": 1,
 				"kv_port": "20002",
 				"kv_connector_extra_config": {
 					"prefill": {
@@ -169,8 +163,6 @@ python3 -m vllm.entrypoints.openai.api_server \
 			{
 				"kv_connector": "MooncakeConnectorStoreV1",
 				"kv_role": "kv_consumer",
-				"kv_buffer_device": "npu",
-				"kv_rank": 1
 			}
 		]
 	}
