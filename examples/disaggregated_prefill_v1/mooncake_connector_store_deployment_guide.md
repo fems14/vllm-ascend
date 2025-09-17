@@ -249,8 +249,6 @@ python3 -m vllm.entrypoints.openai.api_server \
     '{
 	"kv_connector": "MooncakeConnectorStoreV1",
 	"kv_role": "kv_producer",
-	"kv_buffer_device": "npu",
-	"kv_rank": 0,
 	"kv_connector_extra_config": {
 		"use_layerwise": false
 	}
