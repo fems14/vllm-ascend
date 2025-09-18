@@ -47,7 +47,7 @@ mooncake_master --port 50088
 
 ### 1.Run `prefill` Node and `decode` Node
 
-Using MultiConnector to simultaneously utilize both p2p connectors and pooled connectors.P2P performs kv_transfer, while pooling creates a larger prefix-cache.
+Using MultiConnector to simultaneously utilize both p2p connectors and pooled connectors. P2P performs kv_transfer, while pooling creates a larger prefix-cache.
 
 `prefill` Node：
 
