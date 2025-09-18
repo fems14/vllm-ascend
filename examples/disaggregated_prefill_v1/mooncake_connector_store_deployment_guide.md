@@ -43,7 +43,7 @@ Under the mooncake folder:
 mooncake_master --port 50088
 ```
 
-## Prefill Decode Disaggregate Scenario
+## Pooling and Prefill Decode Disaggregate Scenario
 
 ### 1.Run `prefill` Node and `decode` Node
 
