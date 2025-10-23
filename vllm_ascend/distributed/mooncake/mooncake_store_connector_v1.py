@@ -1,7 +1,7 @@
 import threading
 from typing import Any, Optional
 
-import torch,os,time
+import torch
 import vllm.envs as envs
 import zmq
 from vllm.attention.backends.abstract import AttentionMetadata
@@ -17,11 +17,8 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_ascend.distributed.mooncake.config_data import (
     LoadSpec, MooncakeConnectorMetadata, ReqMeta, RequestTracker)
-from vllm_ascend.distributed.mooncake.mooncake_engine_a import MooncakeEngine
+from vllm_ascend.distributed.mooncake.mooncake_engine import MooncakeEngine
 
-def cylog(msg):
-    with open(f"/home/dfq/logs/worker_{os.getpid()}.log", "a") as f:
-        f.write(f"{msg}\n")
 
 class MooncakeConnectorV1(KVConnectorBase_V1):
 
@@ -59,7 +56,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
     def get_num_new_matched_tokens(
             self, request: "Request",
             num_computed_tokens: int) -> tuple[int, bool]:
-        # return 0,False
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens)
@@ -67,7 +63,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
-        # return
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(
             request, blocks, num_external_tokens)
@@ -76,7 +71,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        # return
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
@@ -85,7 +79,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        # return False, None
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
@@ -98,7 +91,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
 
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs) -> None:
-        # return
         assert self.connector_worker is not None
         assert isinstance(self._get_connector_metadata(),
                           MooncakeConnectorMetadata)
@@ -123,7 +115,6 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
 
     def wait_for_save(self):
         """MooncakeStoreConnector does not save explicitly."""
-        # return
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
@@ -137,13 +128,9 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
     def get_finished(self,
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
-        # return set(), set()
-        # st_work=time.time()
         assert self.connector_worker is not None
         meta = self._get_connector_metadata()
         done_sending, done_recving = self.connector_worker.get_finished()
-        # done_sending=set()
-        # done_recving=set()
         sended_and_finished: set[str] = set()
         for item in list(self.sended_but_unfinished_reqs):
             if item not in meta.unfinished_request_ids:
@@ -154,7 +141,7 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
                 self.sended_but_unfinished_reqs.add(item)
             else:
                 sended_and_finished.add(item)
-        # cylog(f"get_finished:{time.time()-st_work}")
+
         return sended_and_finished, done_recving
 
 
@@ -176,6 +163,8 @@ class MooncakeStoreConnectorV1Scheduler:
         self.client = MooncakeLookupClient(vllm_config)
         self.use_layerwise = use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "load_async", False)
         # request_id -> (vllm cached tokes, mooncake cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
         self._block_size = vllm_config.cache_config.block_size
@@ -205,8 +194,7 @@ class MooncakeStoreConnectorV1Scheduler:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        if self.kv_role == "kv_consumer":
-            return 0, False
+
         if self._discard_partial_chunks:
             token_block_end = len(request.prompt_token_ids
                                   ) // self._block_size * self._block_size
@@ -238,8 +226,9 @@ class MooncakeStoreConnectorV1Scheduler:
             mooncake_cached_tokens=num_external_hit_tokens,
             can_load=False,
         )
-        # return 0, False
-        return need_to_allocate, not self.use_layerwise
+
+        # return need_to_allocate, not self.use_layerwise
+        return need_to_allocate, self.load_async
 
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
@@ -430,12 +419,10 @@ class MooncakeStoreConnectorV1Scheduler:
             return False, None
         if self._request_trackers[request.request_id].num_saved_tokens <= 0:
             return False, None
-        
         delay_free_blocks = len(block_ids) > 0
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s",
                         len(block_ids), request.request_id)
-        # return False,None
         return delay_free_blocks, None
 
 
