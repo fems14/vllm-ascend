@@ -74,7 +74,7 @@ class AscendMLATorchairPrefillMetadata:
         chunk_seq_lens: torch.Tensor
 
     attn_mask: torch.Tensor
-    query_lens: list[int]
+    query_lens: torch.Tensor
     seq_lens: list[int]
     context_lens: torch.Tensor
     input_positions: torch.Tensor
@@ -426,8 +426,8 @@ class AscendMLATorchairMetadataBuilder:
         if num_prefills > 0:
             reqs_start = num_decodes  # prefill_start
             tokens_start = num_decode_tokens
-            max_query_len = query_lens[tokens_start:].max().item()
-            max_seq_lens = seq_lens[tokens_start:].max().item()
+            max_query_len = query_lens[reqs_start:].max().item()
+            max_seq_lens = seq_lens[reqs_start:].max().item()
             prefill_query_start_loc = query_start_loc[
                 reqs_start:] - query_start_loc[reqs_start]
 
@@ -473,9 +473,9 @@ class AscendMLATorchairMetadataBuilder:
                     1).unsqueeze(2)
             prefill_metadata = AscendMLATorchairPrefillMetadata(
                 attn_mask=common_attn_metadata.attn_mask,
-                query_lens=query_lens[tokens_start:],
+                query_lens=query_lens[reqs_start:].to(torch.int32),
                 seq_lens=seq_lens,
-                context_lens=seq_lens[tokens_start:],
+                context_lens=seq_lens[reqs_start:],
                 input_positions=prefill_input_positions,
                 block_table=block_table[reqs_start:, ...],
                 max_query_len=max_query_len,
@@ -880,9 +880,7 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
                                    k_rope=k_pe,
                                    value=value,
                                    mask=self.prefill_mask,
-                                   seqlen=torch.tensor(
-                                       attn_metadata.prefill.query_lens,
-                                       dtype=torch.int32),
+                                   seqlen=attn_metadata.prefill.query_lens,
                                    head_num=self.num_heads,
                                    kv_head_num=self.num_heads,
                                    pre_out=None,
@@ -1099,7 +1097,7 @@ class AscendMLATorchairImpl(MLAAttentionImpl):
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
-            return output
+            return output.fill_(0)
         self.running_in_graph = self.torchair_graph_enabled and attn_metadata.attn_state in [
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         ]

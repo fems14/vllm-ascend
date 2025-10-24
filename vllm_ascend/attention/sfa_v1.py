@@ -307,9 +307,9 @@ class AscendSFAMetadataBuilder:
 
         if self.cos_cache is None:
             self.cos_cache = model.model.layers[
-                0].self_attn.rotary_emb.cos_cached
+                model.model.start_layer].self_attn.rotary_emb.cos_cached
             self.sin_cache = model.model.layers[
-                0].self_attn.rotary_emb.sin_cached
+                model.model.start_layer].self_attn.rotary_emb.sin_cached
         if self.cos_cache.dtype != self.model_config.dtype:  # type: ignore
             self.cos_cache = self.cos_cache.to(  # type: ignore
                 self.model_config.dtype)  # type: ignore
@@ -419,6 +419,7 @@ class AscendSFAMetadataBuilder:
                 cos=cos)
 
         return self.metadata_cls(  # type: ignore
+            num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,
             query_lens=query_lens.tolist(),
             slot_mapping=slot_mapping,
@@ -492,25 +493,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.qk_head_dim = kwargs['qk_head_dim']
         self.v_head_dim = kwargs['v_head_dim']
         self.rotary_emb = kwargs['rotary_emb']
-        self.q_proj = kwargs['q_proj']
+        self.q_proj = kwargs['q_proj'] if self.q_lora_rank is None else kwargs[
+            'q_b_proj']
+        self.fused_qkv_a_proj = kwargs.get('fused_qkv_a_proj', None)
         self.kv_b_proj = kwargs['kv_b_proj']
         self.o_proj = kwargs['o_proj']
         self.indexer = kwargs['indexer']
         self.kv_a_proj_with_mqa = kwargs.get('kv_a_proj_with_mqa', None)
         self.kv_a_layernorm = kwargs.get('kv_a_layernorm', None)
-        self.q_a_proj = kwargs.get('q_a_proj', None)
         self.q_a_layernorm = kwargs.get('q_a_layernorm', None)
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_per_rank = self.num_heads // self.tp_size
-        if self.q_a_proj is not None:
-            self.q_b_proj = self.q_proj
-        else:
-            self.q_b_proj = None
+        self.q_b_proj = kwargs['q_b_proj']
 
         ascend_config = get_ascend_config()
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
-        self.enable_prefetch = ascend_config.enable_prefetch
         self.enable_kv_nz = ascend_config.torchair_graph_config.enable_kv_nz
 
         vllm_config = get_current_vllm_config()
@@ -629,10 +627,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         if has_decode:
             q_len = 1
             hidden_states_decode = hidden_states[:num_decode_tokens]
-            decode_kq = self.q_a_proj(hidden_states_decode)  # q down
-            decode_q_c = self.q_a_layernorm(decode_kq)  # q down layernorm
-            decode_kv_no_split = self.kv_a_proj_with_mqa(
-                hidden_states_decode)  # c_kv
+            decode_qkv_lora = self.fused_qkv_a_proj(hidden_states_decode)[0]
+            decode_q_c, decode_kv_no_split = decode_qkv_lora.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+            decode_q_c = self.q_a_layernorm(decode_q_c)  # q down layernorm
+            decode_kv_no_split = decode_kv_no_split.contiguous()
 
             # decode_q_c = q_c[:num_decode_tokens]
             decode_slot_mapping = attn_metadata.slot_mapping[:
@@ -690,6 +691,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_indices = self.indexer_select(hidden_states_decode,
                                                decode_q_c,
                                                attn_metadata=attn_metadata,
+                                               cos=cos,
+                                               sin=sin,
                                                kv_cache=kv_cache)
 
             query_states = (decode_q_nope, decode_q_pe)
@@ -711,10 +714,13 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             hidden_states_prefill = hidden_states[
                 num_decode_tokens:num_actual_tokens]
-            prefill_kq = self.q_a_proj(hidden_states_prefill)  # q down
-            prefill_q_c = self.q_a_layernorm(prefill_kq)  # q down layernorm
-            prefill_kv_no_split = self.kv_a_proj_with_mqa(
-                hidden_states_prefill)  # c_kv
+            prefill_qkv_lora = self.fused_qkv_a_proj(hidden_states_prefill)[0]
+            prefill_q_c, prefill_kv_no_split = prefill_qkv_lora.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+            prefill_q_c = self.q_a_layernorm(prefill_q_c)  # q down layernorm
+            prefill_kv_no_split = prefill_kv_no_split.contiguous()
 
             # prefill_q_c = q_c[
             #     num_decode_tokens:num_actual_tokens]
@@ -778,6 +784,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_indices = self.indexer_select(x=hidden_states_prefill,
                                                qr=prefill_qr,
                                                kv_cache=kv_cache,
+                                               cos=cos,
+                                               sin=sin,
                                                attn_metadata=attn_metadata)
             query_states = (prefill_q_nope, prefill_q_pe)
             key_states = (prefill_k_nope, prefill_k_pe)
@@ -804,7 +812,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
-            return output
+            return output.fill_(0)
         num_actual_tokens = attn_metadata.num_actual_tokens
         assert attn_metadata.num_decodes is not None and \
         attn_metadata.num_prefills is not None and \
@@ -920,17 +928,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         x: torch.Tensor,
         qr: torch.Tensor,
         kv_cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        cos,
+        sin,
         attn_metadata: M,
     ):
         if attn_metadata.prefill is not None:
-            cos = attn_metadata.prefill.cos
-            sin = attn_metadata.prefill.sin
             actual_seq_lengths_query = attn_metadata.prefill.query_lens
             actual_seq_lengths_key = attn_metadata.prefill.seq_lens
             block_table = attn_metadata.prefill.block_table
         elif attn_metadata.decode is not None:
-            cos = attn_metadata.decode.cos
-            sin = attn_metadata.decode.sin
             actual_seq_lengths_query = attn_metadata.decode.actual_seq_lengths_q
             actual_seq_lengths_key = attn_metadata.decode.seq_lens
             block_table = attn_metadata.decode.block_table

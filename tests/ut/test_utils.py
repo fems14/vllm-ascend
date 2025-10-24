@@ -39,6 +39,14 @@ class TestUtils(TestBase):
                         "Ascend910P1"):
             self.assertFalse(utils.is_310p())
 
+    def test_is_enable_nz(self):
+        with mock.patch("vllm_ascend.utils.envs_ascend.VLLM_ASCEND_ENABLE_NZ",
+                        1):
+            self.assertTrue(utils.is_enable_nz())
+        with mock.patch("vllm_ascend.utils.envs_ascend.VLLM_ASCEND_ENABLE_NZ",
+                        0):
+            self.assertFalse(utils.is_enable_nz())
+
     def test_sleep_mode_enabled(self):
         utils._SLEEP_MODE_ENABLED = None
         with mock.patch("vllm_ascend._build_info.__sleep_mode_enabled__",
@@ -250,11 +258,15 @@ class TestUtils(TestBase):
         model_path = os.path.join(os.path.dirname(__file__), "fake_weight")
         test_model_config = ModelConfig(model=model_path, enforce_eager=True)
         test_parallel_config = ParallelConfig()
+        ascend_config = mock.MagicMock()
+        ascend_config.max_num_batched_tokens = 2048
+        ascend_config.max_model_len = 1024
+        ascend_config.ascend_scheduler_config.enabled = False
         test_vllm_config = VllmConfig(
             model_config=test_model_config,
             compilation_config=test_compilation_config,
             parallel_config=test_parallel_config,
-        )
+            additional_config=ascend_config)
         utils.update_aclgraph_sizes(test_vllm_config)
         os.environ['HCCL_OP_EXPANSION_MODE'] = 'AIV'
         utils.update_aclgraph_sizes(test_vllm_config)
@@ -264,6 +276,7 @@ class TestUtils(TestBase):
             len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
 
         test_vllm_config.speculative_config = mock.MagicMock()
+        test_vllm_config.speculative_config.num_speculative_tokens = 2
         test_vllm_config.speculative_config.draft_model_config = mock.MagicMock(
         )
         test_vllm_config.speculative_config.draft_model_config.hf_config = mock.MagicMock(
