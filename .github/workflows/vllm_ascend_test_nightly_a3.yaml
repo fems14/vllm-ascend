@@ -62,9 +62,21 @@ jobs:
           - name: qwen2-5-vl-7b
             os: linux-aarch64-a3-4
             tests: tests/e2e/nightly/models/test_qwen2_5_vl_7b.py
+          - name: qwen2-5-vl-32b
+            os: linux-aarch64-a3-4
+            tests: tests/e2e/nightly/models/test_qwen2_5_vl_32b.py
+          - name: qwen3-32b-int8-prefix-cache
+            os: linux-aarch64-a3-4
+            tests: tests/e2e/nightly/features/test_prefix_cache_qwen3_32b_int8.py
           - name: deepseek-r1-0528-w8a8
             os: linux-aarch64-a3-16
             tests: tests/e2e/nightly/models/test_deepseek_r1_0528_w8a8.py
+          - name: deepseek-r1-0528-w8a8-prefix-cache
+            os: linux-aarch64-a3-16
+            tests: tests/e2e/nightly/features/test_prefix_cache_deepseek_r1_0528_w8a8.py
+          - name: qwq-32b-a3
+            os: linux-aarch64-a3-4
+            tests: tests/e2e/nightly/models/test_qwq_32b.py
     uses: ./.github/workflows/_e2e_nightly_single_node.yaml
     with:
       vllm: v0.11.0
@@ -89,10 +101,28 @@ jobs:
           - name: multi-node-dpsk-4node-pd
             config_file_path: tests/e2e/nightly/multi_node/config/models/DeepSeek-R1-W8A8.yaml
             size: 4
+          - name: multi-node-qwenw8a8-2node
+            config_file_path: tests/e2e/nightly/multi_node/config/models/Qwen3-235B-W8A8.yaml
+            size: 2
+          - name: multi-node-glm-2node
+            config_file_path: tests/e2e/nightly/multi_node/config/models/GLM-4_5.yaml
+            size: 2
     uses: ./.github/workflows/_e2e_nightly_multi_node.yaml
     with:
       soc_version: a3
+      runner: linux-aarch64-a3-0
       image: m.daocloud.io/quay.io/ascend/cann:8.2.rc1-a3-ubuntu22.04-py3.11
       replicas: 1
       size: ${{ matrix.test_config.size }}
       config_file_path: ${{ matrix.test_config.config_file_path }}
+    secrets:
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+
+  clear_resources:
+    needs: multi-node-tests
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/_kill_lws_resources.yaml
+    with:
+      runner: linux-aarch64-a3-0
+    secrets:
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
