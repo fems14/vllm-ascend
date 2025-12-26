@@ -16,12 +16,12 @@
 **backend**: Set the storage backend for kvpool, with the default being mooncake.
 
 ### Environment Variable Configuration
-To guarantee uniform hash generation, it is required to synchronize the PYTHONHASHSEED environment variable across all nodes upon enabling pooling.
+To guarantee uniform hash generation, it is required to synchronize the PYTHONHASHSEED environment variable across all nodes upon enabling KV Pool.
 ```bash
 export PYTHONHASHSEED=0 
 ```
 
-## Example of using Mooncake as a KVCache pooling backend
+## Example of using Mooncake as a KV Pool backend
 * Software:
     * Check NPU network configuration:
 
