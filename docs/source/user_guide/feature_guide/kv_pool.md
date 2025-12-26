@@ -102,7 +102,7 @@ The environment variable **MOONCAKE_CONFIG_PATH** is configured to the full path
 **master_server_address**: Configured with the IP and port of the master service.  
 **global_segment_size**: Registered memory size per card to the KV Pool.
 
-#### 2. Start mooncake_master
+#### 2.Start mooncake_master
 
 Under the mooncake folder:
 
@@ -255,7 +255,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     }'
 ```
 
-#### 2、Start proxy_server.
+#### 2.Start proxy_server.
 ```
 python vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py \
     --host localhost\
@@ -266,7 +266,7 @@ python vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_e
 ```
 Change localhost to your actual IP address.
 
-#### 3. Run Inference
+#### 3.Run Inference
 
 Configure the localhost, port, and model weight path in the command to your own settings.
 
@@ -284,7 +284,7 @@ curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json"
 
 ### Colocation Scenario
 
-#### 1、Run Mixed Department Script
+#### 1.Run Mixed Department Script
 
 ```
 bash mixed_department.sh
@@ -325,7 +325,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 }' > mix.log 2>&1
 ```
 
-#### 2. Run Inference
+#### 2.Run Inference
 
 Configure the localhost, port, and model weight path in the command to your own settings. The requests sent will only go to the port where the mixed deployment script is located, and there is no need to start a separate proxy.
 
