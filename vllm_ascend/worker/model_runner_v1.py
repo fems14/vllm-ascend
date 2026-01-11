@@ -2062,6 +2062,11 @@ class NPUModelRunner(GPUModelRunner):
         if self.is_kv_producer and not self.is_kv_consumer:
             with_prefill = True
 
+        has_lora = True if self.lora_config and self.compilation_config.cudagraph_specialize_lora else False
+        _, batch_descriptor = \
+            self.cudagraph_dispatcher.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora)
+        num_tokens = batch_descriptor.num_tokens
+
         # Padding for DP
         (num_tokens, num_tokens_across_dp,
          with_prefill) = self._sync_metadata_across_dp(num_tokens,
@@ -2112,7 +2117,6 @@ class NPUModelRunner(GPUModelRunner):
         if not is_profile and self.dynamic_eplb:
             self.eplb_updator.forward_before()
 
-        has_lora = True if self.lora_config and self.compilation_config.cudagraph_specialize_lora else False
         _ag_mode, batch_descriptor = \
             self.cudagraph_dispatcher.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora)
 
