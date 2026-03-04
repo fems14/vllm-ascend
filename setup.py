@@ -16,6 +16,9 @@
 # This file is a part of the vllm-ascend project.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/setup.py
 #
+def is_false(value: str) -> bool:
+    """Check if the given string value is equivalent to 'false'."""
+    return value.lower() in ("false", "0", "no", "n", "off")
 
 import importlib.util
 import logging
